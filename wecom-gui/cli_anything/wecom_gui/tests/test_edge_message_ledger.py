@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
 import sqlite3
+import subprocess
+import sys
 from unittest.mock import Mock
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,6 +40,106 @@ def capture(monkeypatch, tmp_path):
 def all_events():
     with edge_state._connect() as conn:
         return [edge_state._event_row(row) for row in conn.execute("SELECT * FROM edge_inbound_events ORDER BY id")]
+
+
+def test_initial_unread_snapshot_keeps_marker_after_upload_retry_and_direction_resolution(capture):
+    snapshot = [message("old-baseline", direction="outbound"), message("old-unread", direction="unknown")]
+    assert capture(snapshot, bootstrap_recent_count=1)["captured"] == 1
+    first = all_events()[0]
+    assert first["payload"]["message"]["source"]["initial_snapshot"] is True
+    with edge_message_ledger.transaction() as conn:
+        rows = list(conn.execute("SELECT initial_snapshot, capture_status FROM edge_message_ledger ORDER BY sequence"))
+        assert [(row["initial_snapshot"], row["capture_status"]) for row in rows] == [
+            (1, "baseline"), (1, "pending_direction"),
+        ]
+    failing = FakeChannel(inbound_error=RuntimeError("offline"))
+    assert edge_worker.flush_inbound(failing)["failed"] == 1
+    assert failing.inbound_calls[0][0]["message"]["source"]["initial_snapshot"] is True
+    assert capture(snapshot, bootstrap_recent_count=1)["captured"] == 0
+    edge_state.retry_inbound(first["client_event_id"], "retry", delay_seconds=0)
+    healthy = FakeChannel()
+    assert edge_worker.flush_inbound(healthy)["delivered"] == 1
+    assert healthy.inbound_calls[0][0]["message"]["source"] == first["payload"]["message"]["source"]
+
+    resolved = [snapshot[0], message("old-unread")]
+    assert capture(resolved)["captured"] == 1
+    assert all_events()[0]["payload"]["message"]["source"] == first["payload"]["message"]["source"]
+    assert all_events()[0]["payload"]["message"]["direction"] == "inbound"
+    assert capture(resolved + [message("new-increment")], bootstrap_recent_count=3)["captured"] == 1
+    assert [event["payload"]["message"]["source"]["initial_snapshot"] for event in all_events()] == [True, False]
+
+
+def test_empty_baseline_makes_first_increment_explicitly_non_initial(capture):
+    assert capture([])["captured"] == 0
+    with edge_message_ledger.transaction() as conn:
+        assert conn.execute("SELECT count(*) FROM edge_message_ledger_heads").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM edge_message_ledger").fetchone()[0] == 0
+    assert capture([message("first-increment")], bootstrap_recent_count=1)["captured"] == 1
+    event = all_events()[0]
+    assert event["payload"]["message"]["source"]["initial_snapshot"] is False
+    assert capture([message("first-increment")])["captured"] == 0
+    with edge_message_ledger.transaction() as conn:
+        assert conn.execute("SELECT initial_snapshot FROM edge_message_ledger").fetchone()[0] == 0
+
+
+def test_initial_snapshot_marker_survives_process_restart(capture, tmp_path):
+    candidates = [{"match_key": value} for value in ["old", "new"]]
+    with edge_message_ledger.transaction() as conn:
+        first, _ = edge_message_ledger.prepare(conn, "restart-chat", candidates[:1], bootstrap_recent_count=1)
+    with edge_message_ledger.transaction() as conn:
+        before, _ = edge_message_ledger.prepare(conn, "restart-chat", candidates)
+    assert [entry["initial_snapshot"] for entry in before] == [1, 0]
+    script = """
+import json
+from cli_anything.wecom_gui.core import edge_message_ledger
+with edge_message_ledger.transaction() as conn:
+    rows, reason = edge_message_ledger.prepare(conn, "restart-chat", [
+        {"match_key": "old"}, {"match_key": "new"}, {"match_key": "after-restart"},
+    ], bootstrap_recent_count=3)
+print(json.dumps({"rows": rows, "reason": reason}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=15,
+        env={**os.environ, "WECOM_GUI_STATE_DIR": str(tmp_path)},
+    )
+    after = json.loads(result.stdout)
+    assert after["reason"] == "aligned"
+    assert [entry["initial_snapshot"] for entry in after["rows"]] == [1, 0, 0]
+    assert [entry["event_id"] for entry in after["rows"][:2]] == [entry["event_id"] for entry in before]
+    assert after["rows"][0]["stream_id"] == first[0]["stream_id"]
+
+
+def test_legacy_ledger_schema_migrates_existing_rows_to_initial(capture):
+    # Build only the old ledger table in the fixture's temporary database.
+    with edge_state._connect() as conn:
+        conn.execute("""CREATE TABLE edge_message_ledger (
+            conversation_key TEXT NOT NULL, sequence INTEGER NOT NULL,
+            match_key TEXT NOT NULL, event_hash TEXT NOT NULL UNIQUE,
+            event_id TEXT NOT NULL, occurred_at REAL NOT NULL,
+            capture_status TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'unknown',
+            PRIMARY KEY (conversation_key, sequence))""")
+        conn.execute("""INSERT INTO edge_message_ledger VALUES (
+            'legacy-chat', 1, 'old', 'legacy-hash', 'legacy-event', 1, 'pending_direction', 'unknown')""")
+    with edge_message_ledger.transaction() as conn:
+        column = next(row for row in conn.execute("PRAGMA table_info(edge_message_ledger)") if row["name"] == "initial_snapshot")
+        assert (column["type"], column["notnull"], column["dflt_value"]) == ("INTEGER", 1, "1")
+        assert conn.execute("SELECT initial_snapshot FROM edge_message_ledger").fetchone()[0] == 1
+        conn.execute("INSERT INTO edge_message_ledger_heads VALUES ('legacy-chat', 1, 'legacy-stream')")
+    with edge_message_ledger.transaction() as conn:
+        rows, reason = edge_message_ledger.prepare(conn, "legacy-chat", [{"match_key": "old"}, {"match_key": "new"}])
+    assert reason == "aligned"
+    assert [entry["initial_snapshot"] for entry in rows] == [1, 0]
+
+
+@pytest.mark.parametrize("marker,expected", [(None, True), (1, True), (0, False)])
+def test_event_source_uses_persisted_initial_snapshot_or_defaults_true(marker, expected):
+    entry = {"event_id": "event-1", "event_hash": "hash-1", "occurred_at": 1,
+             "stream_id": "stream-1", "sequence": 2}
+    if marker is not None:
+        entry["initial_snapshot"] = marker
+    _, event, _ = edge_worker._event_for_row({}, {}, message("test"), "customer-1", 1, ledger_entry=entry)
+    assert event["message"]["source"] == {"stream_id": "stream-1", "sequence": 2, "initial_snapshot": expected}
+    assert event["message"]["source"]["initial_snapshot"] is expected
 
 
 def test_window_sliding_and_direction_resolution_keep_original_identity_and_time(capture):
@@ -132,8 +236,10 @@ def test_ambiguous_or_disjoint_snapshot_is_retained_without_advancing_tail(captu
     assert edge_state.edge_status()["message_alignment_pending"] == 1
 
 
-def test_queue_failure_keeps_reserved_ids_without_marking_captured(capture, monkeypatch):
-    capture([])
+@pytest.mark.parametrize("initial_snapshot", [True, False])
+def test_queue_failure_keeps_reserved_ids_without_marking_captured(capture, monkeypatch, initial_snapshot):
+    if not initial_snapshot:
+        capture([])
     original_enqueue = edge_state.enqueue_inbound
     calls = 0
 
@@ -145,15 +251,17 @@ def test_queue_failure_keeps_reserved_ids_without_marking_captured(capture, monk
         return original_enqueue(**kwargs)
 
     monkeypatch.setattr(edge_state, "enqueue_inbound", fail_second)
-    assert not capture([message("A"), message("B")])["ok"]
+    assert not capture([message("A"), message("B")], bootstrap_recent_count=2)["ok"]
     assert all_events() == []
     with edge_message_ledger.transaction() as conn:
         reserved = [dict(row) for row in conn.execute("SELECT * FROM edge_message_ledger ORDER BY sequence")]
         assert len(reserved) == 2
         assert all(row["capture_status"] == "pending_direction" for row in reserved)
+        assert all(row["initial_snapshot"] == int(initial_snapshot) for row in reserved)
     monkeypatch.setattr(edge_state, "enqueue_inbound", original_enqueue)
     assert capture([message("A"), message("B")])["captured"] == 2
     assert [event["payload"]["message"]["id"] for event in all_events()] == [row["event_id"] for row in reserved]
+    assert all(event["payload"]["message"]["source"]["initial_snapshot"] is initial_snapshot for event in all_events())
 
 
 def test_scroll_back_to_unique_history_does_not_move_tail_or_resend(capture):
@@ -325,9 +433,11 @@ def test_image_baseline_is_not_captured_or_uploaded(capture, grab_images):
 
 
 @pytest.mark.parametrize("direction", ["inbound", "outbound"])
-def test_capture_then_upload_retry_and_direction_resolution_reuse_files(capture, grab_images, direction):
-    capture([])
-    assert capture([image_message(count=2)])["captured"] == 1
+@pytest.mark.parametrize("initial_snapshot", [True, False])
+def test_capture_then_upload_retry_and_direction_resolution_reuse_files(capture, grab_images, direction, initial_snapshot):
+    if not initial_snapshot:
+        capture([])
+    assert capture([image_message(count=2)], bootstrap_recent_count=1)["captured"] == 1
     original = all_events()[0]
     assert len(original["media"]) == 2
     assert all(item["sha256"] for item in original["media"])
@@ -344,12 +454,15 @@ def test_capture_then_upload_retry_and_direction_resolution_reuse_files(capture,
     assert resolved["payload"]["message"]["id"] == original["payload"]["message"]["id"]
     assert resolved["payload"]["occurred_at"] == original["payload"]["occurred_at"]
     assert resolved["payload"]["message"]["source"] == original["payload"]["message"]["source"]
+    assert resolved["payload"]["message"]["source"]["initial_snapshot"] is initial_snapshot
     assert resolved["payload"]["message"]["direction"] == direction
     assert resolved["media"] == original["media"]
 
 
-def test_partial_capture_waits_and_recovers_same_message_after_backoff(capture, grab_images, monkeypatch):
-    capture([])
+@pytest.mark.parametrize("initial_snapshot", [True, False])
+def test_partial_capture_waits_and_recovers_same_message_after_backoff(capture, grab_images, monkeypatch, initial_snapshot):
+    if not initial_snapshot:
+        capture([])
     successful = grab_images.side_effect
     now = edge_worker.time.time()
     monkeypatch.setattr(edge_worker.time, "time", lambda: now)
@@ -359,12 +472,15 @@ def test_partial_capture_waits_and_recovers_same_message_after_backoff(capture, 
         result["media"].append({"type": "image", "error": "preview_not_found"})
         return result
     grab_images.side_effect = partial
-    assert capture([image_message(count=2)])["pending_media"] == 1
+    assert capture([image_message(count=2)], bootstrap_recent_count=1)["pending_media"] == 1
     assert len(all_events()) == 1
     assert not edge_state.media_files_ready(all_events()[0]["media"])
     with edge_message_ledger.transaction() as conn:
         first = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
     assert first["capture_status"] == "pending_media"
+    assert first["initial_snapshot"] == int(initial_snapshot)
+    original_source = all_events()[0]["payload"]["message"]["source"]
+    assert original_source["initial_snapshot"] is initial_snapshot
     assert edge_state.edge_status()["media_capture_pending"] == 1
     assert capture([image_message(count=2)])["pending_media"] == 1
     assert grab_images.call_count == 1
@@ -373,6 +489,9 @@ def test_partial_capture_waits_and_recovers_same_message_after_backoff(capture, 
     assert capture([image_message(count=2)])["captured"] == 0
     assert grab_images.call_args.args[-1] == [1]
     assert all_events()[0]["payload"]["message"]["id"] == first["event_id"]
+    assert all_events()[0]["payload"]["message"]["source"] == original_source
+    with edge_message_ledger.transaction() as conn:
+        assert conn.execute("SELECT initial_snapshot FROM edge_message_ledger").fetchone()[0] == int(initial_snapshot)
     assert edge_state.edge_status()["media_capture_pending"] == 0
 
 

@@ -198,6 +198,7 @@ def test_capture_unread_text_and_image_to_durable_spool(monkeypatch, tmp_path):
     assert result["captured"] == 1
     assert event["payload"]["conversation"]["external_user_id"] == "customer-1"
     assert event["payload"]["message"]["text"] == "请看图片"
+    assert event["payload"]["message"]["source"]["initial_snapshot"] is True
     assert event["media"][0]["capture_path"] == str(image_path)
     assert event["payload"]["message"]["media"][0]["sha256"]
 
@@ -237,6 +238,7 @@ def test_capture_all_customer_messages_in_one_unresolved_turn(monkeypatch, tmp_p
     assert result["captured"] == 3
     assert [event["payload"]["message"]["text"] for event in events] == ["第一句", "第一句", "第三句"]
     assert len({event["client_event_id"] for event in events}) == 3
+    assert all(event["payload"]["message"]["source"]["initial_snapshot"] is True for event in events)
 
 
 def test_visible_staff_message_remains_unknown_without_a_central_delivery_echo(monkeypatch, tmp_path):

@@ -34,6 +34,7 @@ def transaction():
             event_id TEXT NOT NULL, occurred_at REAL NOT NULL,
             capture_status TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'unknown',
             PRIMARY KEY (conversation_key, sequence))""")
+        edge_state._ensure_column(conn, "edge_message_ledger", "initial_snapshot", "INTEGER NOT NULL DEFAULT 1")
         conn.execute("""CREATE TABLE IF NOT EXISTS edge_message_alignment_pending (
             conversation_key TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
             snapshot_json TEXT NOT NULL, observed_at REAL NOT NULL,
@@ -143,6 +144,7 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
             "event_id": f"edge-msg-{event_hash[:32]}", "occurred_at": now,
             "capture_status": "baseline" if index < baseline_end else "pending_direction",
             "direction": "unknown",
+            "initial_snapshot": int(head is None),
         }
         previous = inherited.get(index)
         if previous:
@@ -151,8 +153,8 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
             row.update(event_hash=message["hash"], event_id=message["id"], direction=direction,
                        capture_status="pending_direction" if direction == "unknown" else "captured")
         conn.execute("""INSERT INTO edge_message_ledger
-            (conversation_key, sequence, match_key, event_hash, event_id, occurred_at, capture_status, direction)
-            VALUES (:conversation_key, :sequence, :match_key, :event_hash, :event_id, :occurred_at, :capture_status, :direction)""", row)
+            (conversation_key, sequence, match_key, event_hash, event_id, occurred_at, capture_status, direction, initial_snapshot)
+            VALUES (:conversation_key, :sequence, :match_key, :event_hash, :event_id, :occurred_at, :capture_status, :direction, :initial_snapshot)""", row)
         rows.append(row)
     conn.execute("DELETE FROM edge_message_alignment_pending WHERE conversation_key = ? AND snapshot_hash = ?",
                  (conversation_key, snapshot_hash))

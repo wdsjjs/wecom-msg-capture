@@ -191,7 +191,8 @@ def _event_for_row(
             "text": _message_text(message),
             "media": [{key: value for key, value in item.items() if key != "capture_path"} for item in media],
             "visible_chat_hash": str(current.get("hash") or ""),
-            **({"source": {"stream_id": ledger_entry["stream_id"], "sequence": ledger_entry["sequence"]}}
+            **({"source": {"stream_id": ledger_entry["stream_id"], "sequence": ledger_entry["sequence"],
+                           "initial_snapshot": bool(ledger_entry.get("initial_snapshot", 1))}}
                if ledger_entry and ledger_entry.get("stream_id") else {}),
         },
     }
