@@ -378,6 +378,99 @@ def grab_images(monkeypatch, tmp_path):
     return mock
 
 
+def loading_image_fingerprint():
+    return pixel_fingerprint([243 + (index // 3) % 11 for index in range(32 * 32 * 3)])
+
+
+def test_loading_image_waits_without_pinning_pixels_or_exhausting_retries(capture, grab_images):
+    capture([])
+    loading = image_message(direction="inbound", fingerprint=loading_image_fingerprint())
+    snapshot = [loading, message("later text")]
+    for _ in range(8):
+        assert capture(snapshot)["pending_media"] == 1
+    assert grab_images.call_count == 0
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger WHERE sequence=1").fetchone())
+    saved = edge_message_ledger.media_state(entry)
+    assert saved["capture_row_id"] == loading["capture_row_id"]
+    assert saved["image_fingerprint"] == ""
+    assert saved["attempts"] == 0 and saved["paused_reason"] == ""
+    before = all_events()
+    assert edge_worker.flush_registrations(DeferredChannel())["registered"] == 2
+    assert all_events()[1]["status"] == edge_state.DELIVERED
+    loaded = image_message(direction="inbound", fingerprint=pixel_fingerprint([80, 100, 140] * 1024))
+    assert capture([loaded, snapshot[1]])["pending_media"] == 0
+    after = all_events()
+    assert after[0]["client_event_id"] == before[0]["client_event_id"]
+    assert after[0]["payload"]["message"]["source"] == before[0]["payload"]["message"]["source"]
+    assert edge_state.media_files_ready(after[0]["media"])
+    assert edge_worker.flush_inbound(DeferredChannel())["delivered"] == 1
+
+
+def test_previously_pinned_loading_frame_recovers_same_row_without_changing_registration(capture, grab_images):
+    capture([])
+    loading = loading_image_fingerprint()
+    capture([image_message(direction="inbound", fingerprint=loading)],
+            media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    before = all_events()[0]
+    assert edge_worker.flush_registrations(DeferredChannel())["registered"] == 1
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+        # Persist the old release's poisoned anchor and exhausted retry state.
+        conn.execute("UPDATE edge_media_capture_state SET image_fingerprint=?, attempts=5, paused_reason='media_retry_limit', last_error='media_fingerprint_changed'",
+                     (loading,))
+    assert edge_message_ledger.resume_media(entry["event_id"])["ok"]
+    loaded = image_message(direction="inbound", fingerprint=pixel_fingerprint([80, 100, 140] * 1024))
+    assert capture([loaded])["pending_media"] == 0
+    after = all_events()[0]
+    assert after["client_event_id"] == before["client_event_id"]
+    assert after["payload"]["occurred_at"] == before["payload"]["occurred_at"]
+    assert after["payload"]["message"]["source"] == before["payload"]["message"]["source"]
+    assert edge_message_ledger.media_state(entry)["image_fingerprint"] == loaded["direction_evidence"]["imageFingerprint"]
+    assert edge_worker.flush_inbound(DeferredChannel())["delivered"] == 1
+    changed = image_message(fingerprint=pixel_fingerprint([20, 180, 60] * 1024))
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_fingerprint_changed"):
+        edge_message_ledger.verify_media_identity(entry, changed, require_pixels=True)
+
+
+@pytest.mark.parametrize("row_id", ["7551:1000:other", "9999:2000:new-process"])
+def test_loading_anchor_cannot_rebind_to_another_ax_row_or_process(capture, row_id):
+    capture([])
+    loading = loading_image_fingerprint()
+    capture([image_message(fingerprint=loading)], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+        conn.execute("UPDATE edge_media_capture_state SET image_fingerprint=?", (loading,))
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_row_identity_changed"):
+        edge_message_ledger.verify_media_identity(entry,
+            image_message(row_id=row_id, fingerprint=pixel_fingerprint([80, 100, 140] * 1024)), require_pixels=True)
+    assert edge_message_ledger.media_state(entry)["image_fingerprint"] == loading
+
+
+def test_loading_fingerprint_never_proves_pixels_available(capture):
+    capture([])
+    loading = image_message(fingerprint=loading_image_fingerprint())
+    capture([loading], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_fingerprint_unavailable"):
+        edge_message_ledger.verify_media_identity(entry, loading, require_pixels=True)
+
+
+def test_white_image_with_real_content_does_not_qualify_for_loading_anchor_replacement(capture):
+    capture([])
+    pixels = [249, 249, 249] * 1024
+    pixels[12:15] = [30, 30, 30]
+    original = pixel_fingerprint(pixels)
+    capture([image_message(fingerprint=original)], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_fingerprint_changed"):
+        edge_message_ledger.verify_media_identity(entry,
+            image_message(fingerprint=pixel_fingerprint([80, 100, 140] * 1024)), require_pixels=True)
+    assert edge_message_ledger.media_state(entry)["image_fingerprint"] == original
+
+
 def test_three_new_images_align_after_old_images_scroll_offscreen(capture, grab_images, monkeypatch):
     viewport = {"x": 311, "y": 100, "width": 700, "height": 600}
 

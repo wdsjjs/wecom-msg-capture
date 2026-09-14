@@ -183,32 +183,45 @@ def media_state(entry: dict) -> dict:
 
 def remember_media_identity(conn, entry: dict, message: dict):
     """Pin initial evidence even when this tick cannot afford to capture the image."""
+    fingerprint = (message.get("direction_evidence") or {}).get("imageFingerprint") or ""
+    if is_loading_image_fingerprint(fingerprint):
+        fingerprint = ""
     conn.execute("""INSERT OR IGNORE INTO edge_media_capture_state
         (event_hash, capture_row_id, image_fingerprint) VALUES (?, ?, ?)""",
-        (entry["event_hash"], message.get("capture_row_id") or "",
-         (message.get("direction_evidence") or {}).get("imageFingerprint") or ""))
+        (entry["event_hash"], message.get("capture_row_id") or "", fingerprint))
+
+
+def _decode_media_fingerprint(value: str) -> tuple[str, bytes | None] | None:
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0] == "rgb32-v1":
+        return parts[1], None
+    if len(parts) != 3 or parts[0] != "rgb32-v2" or len(parts[1]) != 64 or len(parts[2]) != 4096:
+        return None
+    try:
+        pixels = base64.b64decode(parts[2], validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if len(pixels) != 32 * 32 * 3:
+        return None
+    digest = hashlib.sha256(bytes(value & 0xf8 for value in pixels)).hexdigest()
+    return (digest, pixels) if digest == parts[1] else None
+
+
+def is_loading_image_fingerprint(value: str) -> bool:
+    """A near-white loading surface cannot identify the eventual image."""
+    decoded = _decode_media_fingerprint(value)
+    if decoded is None or decoded[1] is None:
+        return False
+    pixels = decoded[1]
+    return (min(pixels) >= 240 and max(pixels) - min(pixels) <= 16
+            and all(max(pixels[i:i + 3]) - min(pixels[i:i + 3]) <= 4 for i in range(0, len(pixels), 3)))
 
 
 def media_fingerprints_match(expected: str, observed: str, *, allow_render_drift: bool = True) -> bool:
     if expected == observed and not expected.startswith("rgb32-v2:"):
         return bool(expected)
 
-    def decode(value):
-        parts = value.split(":")
-        if len(parts) == 2 and parts[0] == "rgb32-v1":
-            return parts[1], None
-        if len(parts) != 3 or parts[0] != "rgb32-v2" or len(parts[1]) != 64 or len(parts[2]) != 4096:
-            return None
-        try:
-            pixels = base64.b64decode(parts[2], validate=True)
-        except (ValueError, binascii.Error):
-            return None
-        if len(pixels) != 32 * 32 * 3:
-            return None
-        digest = hashlib.sha256(bytes(value & 0xf8 for value in pixels)).hexdigest()
-        return (digest, pixels) if digest == parts[1] else None
-
-    before, after = decode(expected), decode(observed)
+    before, after = _decode_media_fingerprint(expected), _decode_media_fingerprint(observed)
     if before is None or after is None:
         return False
     if before[0] == after[0]:
@@ -240,6 +253,8 @@ def media_fingerprints_match(expected: str, observed: str, *, allow_render_drift
 def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = False):
     row_id = str(message.get("capture_row_id") or "")
     fingerprint = str((message.get("direction_evidence") or {}).get("imageFingerprint") or "")
+    if is_loading_image_fingerprint(fingerprint):
+        fingerprint = ""
     if not row_id:
         raise MediaIdentityError("media_row_identity_unavailable")
     if require_pixels and not fingerprint:
@@ -247,16 +262,22 @@ def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = 
     with transaction() as conn:
         remember_media_identity(conn, entry, message)
         old = conn.execute("SELECT * FROM edge_media_capture_state WHERE event_hash = ?", (entry["event_hash"],)).fetchone()
-        if old["image_fingerprint"] and fingerprint and not media_fingerprints_match(old["image_fingerprint"], fingerprint):
+        loading_anchor = is_loading_image_fingerprint(old["image_fingerprint"])
+        anchor = "" if loading_anchor else old["image_fingerprint"]
+        if loading_anchor and old["capture_row_id"] != row_id:
+            raise MediaIdentityError("media_row_identity_changed")
+        if anchor and fingerprint and not media_fingerprints_match(anchor, fingerprint):
             raise MediaIdentityError("media_fingerprint_changed")
         if old["capture_row_id"] and old["capture_row_id"] != row_id:
             # An app restart invalidates AX handles. Rebind only with already pinned
             # pixels and the ordered ledger; never on another identical placeholder.
             restarted = old["capture_row_id"].rsplit(":", 1)[0] != row_id.rsplit(":", 1)[0]
             if not (restarted and fingerprint and media_fingerprints_match(
-                    old["image_fingerprint"], fingerprint, allow_render_drift=False)):
+                    anchor, fingerprint, allow_render_drift=False)):
                 raise MediaIdentityError("media_row_identity_changed")
-        upgrade = old["image_fingerprint"].startswith("rgb32-v1:") and fingerprint.startswith("rgb32-v2:")
+        # Replace an old loading sample only on its original AX row; real anchors never drift.
+        upgrade = bool(fingerprint) and (loading_anchor
+            or (anchor.startswith("rgb32-v1:") and fingerprint.startswith("rgb32-v2:")))
         conn.execute("""UPDATE edge_media_capture_state SET capture_row_id = ?,
             image_fingerprint = CASE WHEN image_fingerprint = '' OR ? THEN ? ELSE image_fingerprint END
             WHERE event_hash = ?""", (row_id, upgrade, fingerprint, entry["event_hash"]))

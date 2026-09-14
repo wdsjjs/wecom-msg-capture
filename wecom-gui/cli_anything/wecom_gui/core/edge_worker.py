@@ -436,6 +436,9 @@ def _prepare_snapshot_media(row, candidates, index, entry, existing, budget):
                 media[i] = {**media[i], **item}
     missing = [i for i, item in enumerate(media) if not edge_state.media_files_ready([item])]
     if missing:
+        if edge_message_ledger.is_loading_image_fingerprint(
+                str((message.get("direction_evidence") or {}).get("imageFingerprint") or "")):
+            return None
         if entry["event_hash"] in budget.attempted_events:
             return None
         if cached["paused_reason"] or cached["attempts"] >= edge_message_ledger.MEDIA_ATTEMPT_LIMIT or cached["next_attempt_at"] > time.time():

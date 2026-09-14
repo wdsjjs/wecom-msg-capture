@@ -6,6 +6,22 @@ The agent is intentionally conservative. It does not use an official WeCom
 messaging API; it operates the visible desktop app through Accessibility,
 AppleScript, clipboard paste, and a local SQLite queue.
 
+## Image Loading And Retry
+
+A digest-checked `rgb32-v2` sample containing only a near-white neutral surface
+is insufficient image identity evidence. Collection retains the AX row identity
+and registers the message, but waits for content pixels without spending capture
+attempts or blocking later text registrations. A genuinely blank white image is
+indistinguishable from this loading surface and remains pending.
+
+Older releases could pin that loading frame and later report
+`media_fingerprint_changed` when the actual image appeared. Such a loading anchor
+can be replaced only on the exact original AX row, including its process identity,
+after normal ordered snapshot validation. Real content anchors retain the existing
+pixel checks; another row or restarted process cannot repair a blank anchor.
+Already exhausted retries require explicit `edge-channel resume-media <event-id>`.
+Attachment repair preserves the original event ID, registration source and time.
+
 ## Operating Modes
 
 Use the modes in this order:
