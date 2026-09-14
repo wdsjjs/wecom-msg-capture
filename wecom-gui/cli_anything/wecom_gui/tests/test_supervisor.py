@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import pytest
 
 from cli_anything.wecom_gui.core import supervisor
+
+
+@pytest.fixture(autouse=True)
+def local_state(monkeypatch, tmp_path):
+    monkeypatch.setattr('cli_anything.wecom_gui.core.state.state_dir', lambda: tmp_path)
+    monkeypatch.setattr(supervisor, 'RUN_DIR', tmp_path)
 
 
 def test_supervisor_does_not_create_a_second_controlled_session(monkeypatch, tmp_path):

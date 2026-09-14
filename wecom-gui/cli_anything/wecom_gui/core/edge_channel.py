@@ -57,6 +57,7 @@ class ChannelClient:
         self.config = config
         self.session = session or requests.Session()
         self.supports_deferred_media = False
+        self.supports_history_recovery = False
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -96,6 +97,16 @@ class ChannelClient:
         )
         payload = result.get("data", result) if isinstance(result, dict) else {}
         self.supports_deferred_media = payload.get("capabilities", {}).get("deferredMediaV1") is True
+        self.supports_history_recovery = payload.get("capabilities", {}).get("historyRecoveryV1") is True
+        return result
+
+    def history_recovery(self, recovery_id: str, action: str) -> dict:
+        result = self._json_request('POST', '/api/wecom-channel/edge/recovery',
+                                    json={'recovery_id': recovery_id, 'action': action})
+        result = result.get('data', result)
+        if (result.get('accepted') is not True or result.get('recovery_id') != recovery_id
+                or result.get('active') is not (action == 'begin')):
+            raise ChannelError('history recovery boundary was not acknowledged')
         return result
 
     def register_message(self, event: dict) -> dict:

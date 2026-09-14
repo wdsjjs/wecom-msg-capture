@@ -6,6 +6,84 @@ The agent is intentionally conservative. It does not use an official WeCom
 messaging API; it operates the visible desktop app through Accessibility,
 AppleScript, clipboard paste, and a local SQLite queue.
 
+## Operating Modes
+
+The legacy AI modes below are separate from the central-channel client. The
+current Mac edge receives central delivery commands; it does not run a local AI.
+
+## Manual History Recovery
+
+The native control panel provides **补齐聊天记录** and **暂停补录**. These use the
+same supervisor and edge process as normal collection:
+
+```bash
+./scripts/wecom-control recover-history
+./scripts/wecom-control pause-recovery
+./scripts/wecom-control runtime-status
+# Explicitly resume ordinary collection and command delivery after recovery:
+./scripts/wecom-control start-edge
+```
+
+Deploy the matching `uda-kefu` backend first. Its device heartbeat must advertise
+`historyRecoveryV1`; older servers cannot accept recovery events safely. A Mac
+worker started before this upgrade must be stopped and started once. The panel
+reports `edge_worker_restart_required` instead of claiming an old worker began
+recovery. Opening/installing the panel never starts collection automatically.
+
+Recovery begins at a normal tick boundary, after any already submitting delivery.
+The button and the physical submit share a local lock: a command still downloading
+attachments is stopped before submission if recovery was requested meanwhile.
+The central `POST /api/wecom-channel/edge/recovery` boundary durably pauses new
+command leases and AI work. Recovery does not pull commands. A lost response is
+retried with the same recovery ID; failures back off up to 60 seconds. Only an
+explicit normal start releases the boundary, after pending message registrations
+are acknowledged. Already-registered images can remain pending; their immutable
+history-only identity prevents later attachment repairs from triggering replies.
+Paused/finished recovery continues network retries but does not navigate WeCom.
+
+Discovery includes read conversations and known contact bindings. Each chat is
+read in windows of at most 20 AX rows with overlapping pages. Recovery walks
+backward until it can join the persisted ordered ledger, then registers messages
+chronologically. Native cursors are revalidated against conversation/table/row
+identity. A resumed visit discards native cursors and uses persisted message IDs.
+Pictures use the same-page identity and pixel checks before and after capture.
+Older pending images and uncertain directions determine how far recovery goes
+back, even beyond the ordinary 200-entry matching window. Clicking recovery again
+grants paused images one new retry budget while preserving their event identities
+and pinned pixel evidence. Joining a recent known page does not hide older work.
+
+There are bounded limits of 100 list pages and 100 history pages per visit. Limits,
+missing anchors, inaccessible conversations and unavailable older history are
+reported as gaps. A scrollbar at the top alone does not prove the complete WeCom
+history was loaded. For a first-seen chat, accessible history is backfilled with
+an explicit incomplete-boundary result when its beginning cannot be proven.
+This result persists across retries and new recovery jobs. Only a verified start
+matching the first ledger row can clear it; a newly created recent anchor cannot.
+Earlier rows discovered before that first registered row remain an explicit gap;
+recovery never renumbers already registered messages to force them into history.
+If a page straddles that boundary, its uniquely matched registered suffix can still
+receive image repairs. The final recheck must also confirm the latest boundary;
+an `ok` page response with an unverified end cannot produce a completed result.
+Recovery is intended for records available in the logged-in desktop client;
+deleted/expired/server-only records cannot be promised. `occurred_at` remains the
+first local observation time when the original WeCom timestamp is unavailable.
+
+`state.sqlite` holds the recovery request, per-chat checkpoints and temporary
+20-row pages. The normal ordered ledger and upload spool retain message identity,
+registration acknowledgement, direction and attachment progress. Telemetry shows
+counts, conversation labels and reason codes only, never message bodies or keys.
+Recovery events retain `message.source.recovery_id` through retries and repairs;
+the central history-only guard prevents old questions from triggering AI replies.
+
+Focused offline validation (no customer sends or production writes):
+
+```bash
+python -m pytest cli_anything/wecom_gui/tests/test_history_recovery.py \
+  cli_anything/wecom_gui/tests/test_recovery_send_gate.py \
+  cli_anything/wecom_gui/tests/test_recovery_ax_paging.py \
+  cli_anything/wecom_gui/tests/test_desktop_render.py -q
+```
+
 ## Image Loading And Retry
 
 A digest-checked `rgb32-v2` sample containing only a near-white neutral surface
@@ -22,7 +100,7 @@ pixel checks; another row or restarted process cannot repair a blank anchor.
 Already exhausted retries require explicit `edge-channel resume-media <event-id>`.
 Attachment repair preserves the original event ID, registration source and time.
 
-## Operating Modes
+## Legacy AI Modes
 
 Use the modes in this order:
 
@@ -128,6 +206,14 @@ Logs:
 
 ## Native Mac Agent
 
+The compact native panel follows the system light/dark appearance. Normal command
+polling is shown as running, with pending history alignment reported separately.
+It distinguishes the local WeCom process, message collection and central connection;
+connection status does not claim that AI reception is enabled. Recovery details
+expand while recovery runs and can be collapsed independently. The reception button
+pauses an active worker or explicitly resumes normal operation after recovery.
+Logs and internal phase/error codes remain available through details and the menu.
+
 Install the AppKit menu-bar client to `~/Applications`:
 
 ```bash
@@ -137,6 +223,15 @@ Install the AppKit menu-bar client to `~/Applications`:
 The client shows a Dock/menu-bar control surface and only reads redacted local
 operational state. The AI reply is generated in the central service and is not
 a Mac process. It never provides a direct customer read/send action.
+
+The breathing indicator uses Core Animation independently of state refreshes.
+Text controls are retained and updated when status changes; animation does not
+redraw or reconstruct text attributes. Native rendering regression tests run
+without reading WeCom, starting an edge worker, or sending messages:
+
+```bash
+python -m pytest cli_anything/wecom_gui/tests/test_desktop_render.py -q
+```
 
 All local lifecycle actions go through one script:
 

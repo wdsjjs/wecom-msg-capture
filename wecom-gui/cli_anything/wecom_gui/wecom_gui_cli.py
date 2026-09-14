@@ -382,6 +382,18 @@ def supervisor_status() -> None:
     _emit_or_fail(supervisor_core.status)
 
 
+@supervisor_group.command('recover-history')
+def supervisor_recover_history() -> None:
+    """Start or resume historical capture without enabling message delivery."""
+    _emit_or_fail(supervisor_core.recover_history)
+
+
+@supervisor_group.command('pause-recovery')
+def supervisor_pause_recovery() -> None:
+    """Pause recovery after the current bounded GUI operation."""
+    _emit_or_fail(supervisor_core.pause_recovery)
+
+
 @supervisor_group.command("start")
 @click.argument("service", type=click.Choice(["edge", "all"]))
 def supervisor_start(service: str) -> None:
@@ -425,7 +437,7 @@ def edge_channel_status() -> None:
 def edge_channel_run(once: bool, poll: float, inbox_limit: int, last: int) -> None:
     """Capture external direct chats and execute centrally issued commands."""
     if once:
-        _emit_or_fail(edge_worker_core.tick, inbox_limit=inbox_limit, last=last)
+        _emit_or_fail(edge_worker_core.run_once, inbox_limit=inbox_limit, last=last)
         return
     edge_worker_core.run_forever(poll_seconds=poll, inbox_limit=inbox_limit, last=last)
 

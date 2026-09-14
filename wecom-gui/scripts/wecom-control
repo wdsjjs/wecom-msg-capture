@@ -128,10 +128,12 @@ case "${1:-}" in
   start-edge) start_edge ;;
   stop-edge) stop_edge ;;
   restart-edge) restart_edge ;;
+  recover-history) "$SUPERVISOR" recover-history ;;
+  pause-recovery) "$SUPERVISOR" pause-recovery ;;
   status) status_all ;;
   runtime-status) runtime_status ;;
   *)
-    print -u2 -- "用法：$0 {start|stop|restart|start-all|start-services|stop-services|start-wecom|stop-wecom|start-edge|stop-edge|restart-edge|status|runtime-status}"
+    print -u2 -- "用法：$0 {start|stop|restart|start-all|start-services|stop-services|start-wecom|stop-wecom|start-edge|stop-edge|restart-edge|recover-history|pause-recovery|status|runtime-status}"
     exit 2
     ;;
 esac

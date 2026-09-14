@@ -9,9 +9,11 @@ import signal
 import subprocess
 import sys
 import time
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 
-from cli_anything.wecom_gui.core import runtime_state
+from cli_anything.wecom_gui.core import runtime_state, recovery_state
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -113,7 +115,37 @@ def status() -> dict:
     return {"ok": True, "services": services, "screen_available": _screen_available()}
 
 
-def start(service: str) -> dict:
+def start(service: str, *, resume_normal: bool = True) -> dict:
+    with _lifecycle_lock():
+        if resume_normal:
+            recovery_state.request_normal()
+        return _start(service)
+
+
+@contextmanager
+def _lifecycle_lock():
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with (RUN_DIR / 'supervisor.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def recover_history() -> dict:
+    with _lifecycle_lock():
+        if _session_running(SERVICES['edge']['session']):
+            edge = next((s for s in runtime_state.snapshot(limit=1)['states'] if s['process'] == 'edge_channel'), {})
+            if edge.get('metrics', {}).get('history_recovery_v1') is not True:
+                raise RuntimeError('edge_worker_restart_required')
+        job = recovery_state.request_start()
+        result = _start('edge')
+    return {'ok': True, 'recovery_id': job['id'], 'service': result}
+
+
+def pause_recovery() -> dict:
+    return {'ok': True, 'recovery': recovery_state.request_pause()}
+
+
+def _start(service: str) -> dict:
     if service not in SERVICES:
         raise ValueError("service must be edge")
     if not _screen_available():
@@ -146,6 +178,12 @@ def start(service: str) -> dict:
 
 
 def stop(service: str) -> dict:
+    with _lifecycle_lock():
+        recovery_state.request_pause()
+        return _stop(service)
+
+
+def _stop(service: str) -> dict:
     if service not in SERVICES:
         raise ValueError("service must be edge")
     spec = SERVICES[service]

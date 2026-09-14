@@ -35,6 +35,8 @@ def transaction():
             capture_status TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'unknown',
             PRIMARY KEY (conversation_key, sequence))""")
         edge_state._ensure_column(conn, "edge_message_ledger", "initial_snapshot", "INTEGER NOT NULL DEFAULT 1")
+        edge_state._ensure_column(conn, "edge_message_ledger", "recovery_id", "TEXT NOT NULL DEFAULT ''")
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_edge_ledger_match ON edge_message_ledger(conversation_key, match_key, sequence)')
         conn.execute("""CREATE TABLE IF NOT EXISTS edge_message_alignment_pending (
             conversation_key TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
             snapshot_json TEXT NOT NULL, observed_at REAL NOT NULL,
@@ -62,7 +64,29 @@ def _alignment(history: list[dict], keys: list[str]) -> tuple[int, int] | None:
     return best[0] if len(best) == 1 else None
 
 
-def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_recent_count: int = 0):
+def recovery_alignment(conn, conversation_key: str, keys: list[str]):
+    """Find a unique old page without loading an unbounded conversation."""
+    if not keys:
+        return None
+    starts = conn.execute('SELECT sequence FROM edge_message_ledger WHERE conversation_key=? AND match_key=? ORDER BY sequence LIMIT 201',
+                          (conversation_key, keys[0])).fetchall()
+    if len(starts) > 200:
+        return None
+    matches = []
+    for start in starts:
+        rows = [dict(r) for r in conn.execute('SELECT * FROM edge_message_ledger WHERE conversation_key=? AND sequence>=? ORDER BY sequence LIMIT ?',
+                                             (conversation_key, start['sequence'], len(keys)))]
+        if rows and [r['match_key'] for r in rows] == keys[:len(rows)]:
+            matches.append(rows)
+    if not matches:
+        return None
+    size = max(len(rows) for rows in matches)
+    best = [rows for rows in matches if len(rows) == size]
+    return (best[0], size) if len(best) == 1 else None
+
+
+def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_recent_count: int = 0,
+            recovery_id: str = ''):
     """Return persistent rows for a snapshot, or retain a gap without moving the tail.
 
     Candidate match keys exclude relative time labels, sender and capture paths.
@@ -122,10 +146,17 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
                      (conversation_key, now, str(uuid.uuid4())))
         start, overlap = 0, 0
     elif history:
-        alignment = _alignment(history, keys)
-        if alignment is None:
-            return gap()
-        start, overlap = alignment
+        if recovery_id:
+            alignment = recovery_alignment(conn, conversation_key, keys)
+            if alignment is None:
+                return gap()
+            history, overlap = alignment
+            start = 0
+        else:
+            alignment = _alignment(history, keys)
+            if alignment is None:
+                return gap()
+            start, overlap = alignment
         # Identical image placeholders do not prove that a sliding window is unchanged.
         # Retain the snapshot for recovery until text or captured visual identity anchors it.
         if overlap >= 2 and all(candidates[i].get("media_only") for i in range(overlap)):
@@ -134,7 +165,8 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
         start, overlap = 0, 0
 
     rows = history[start:start + overlap]
-    sequence = history[-1]["sequence"] if history else 0
+    sequence = conn.execute('SELECT coalesce(max(sequence),0) FROM edge_message_ledger WHERE conversation_key=?',
+                            (conversation_key,)).fetchone()[0]
     for index in range(overlap, len(keys)):
         sequence += 1
         event_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
@@ -145,6 +177,7 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
             "capture_status": "baseline" if index < baseline_end else "pending_direction",
             "direction": "unknown",
             "initial_snapshot": int(head is None),
+            "recovery_id": recovery_id,
         }
         previous = inherited.get(index)
         if previous:
@@ -153,8 +186,8 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
             row.update(event_hash=message["hash"], event_id=message["id"], direction=direction,
                        capture_status="pending_direction" if direction == "unknown" else "captured")
         conn.execute("""INSERT INTO edge_message_ledger
-            (conversation_key, sequence, match_key, event_hash, event_id, occurred_at, capture_status, direction, initial_snapshot)
-            VALUES (:conversation_key, :sequence, :match_key, :event_hash, :event_id, :occurred_at, :capture_status, :direction, :initial_snapshot)""", row)
+            (conversation_key, sequence, match_key, event_hash, event_id, occurred_at, capture_status, direction, initial_snapshot, recovery_id)
+            VALUES (:conversation_key, :sequence, :match_key, :event_hash, :event_id, :occurred_at, :capture_status, :direction, :initial_snapshot, :recovery_id)""", row)
         rows.append(row)
     conn.execute("DELETE FROM edge_message_alignment_pending WHERE conversation_key = ? AND snapshot_hash = ?",
                  (conversation_key, snapshot_hash))
@@ -165,6 +198,13 @@ def prepare(conn, conversation_key: str, candidates: list[dict], *, bootstrap_re
         conn.execute("UPDATE edge_message_ledger_heads SET stream_id = ? WHERE conversation_key = ?", (stream_id, conversation_key))
     for row in rows:
         row["stream_id"] = stream_id
+        if recovery_id and row['capture_status'] == 'baseline':
+            # Baselines were never registered. Explicit recovery can promote
+            # them without changing the source contract of existing messages.
+            conn.execute("""UPDATE edge_message_ledger SET capture_status='pending_direction', recovery_id=?
+                WHERE conversation_key=? AND sequence=? AND capture_status='baseline'""",
+                (recovery_id, conversation_key, row['sequence']))
+            row.update(capture_status='pending_direction', recovery_id=recovery_id)
     return rows, "aligned"
 
 

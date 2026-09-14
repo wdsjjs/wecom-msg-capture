@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import time
+import fcntl
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cli_anything.wecom_gui.core import chat, edge_channel, edge_message_ledger, edge_state, inbox, reply, runtime_reporting, state
+from cli_anything.wecom_gui.core import chat, edge_channel, edge_message_ledger, edge_state, inbox, reply, runtime_reporting, state, recovery_state
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -192,7 +193,8 @@ def _event_for_row(
             "media": [{key: value for key, value in item.items() if key != "capture_path"} for item in media],
             "visible_chat_hash": str(current.get("hash") or ""),
             **({"source": {"stream_id": ledger_entry["stream_id"], "sequence": ledger_entry["sequence"],
-                           "initial_snapshot": bool(ledger_entry.get("initial_snapshot", 1))}}
+                           "initial_snapshot": bool(ledger_entry.get("initial_snapshot", 1)),
+                           **({'recovery_id': ledger_entry['recovery_id']} if ledger_entry.get('recovery_id') else {})}}
                if ledger_entry and ledger_entry.get("stream_id") else {}),
         },
     }
@@ -343,7 +345,7 @@ class MediaCaptureBudget:
             self.elapsed += time.monotonic() - started
 
 
-def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=None):
+def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=None, snapshot_reader=None):
     macos_backend.activate_app()
     last = max(20, len(candidates))
     expected = candidates[index][1]
@@ -354,7 +356,7 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
         nonlocal fingerprint
         if not _row_matches_opened(row, macos_backend.selected_conversation_row(limit=30)):
             raise MediaCapturePending("media_conversation_changed")
-        fresh = chat.read_current(last=last, capture_images=False)
+        fresh = snapshot_reader() if snapshot_reader else chat.read_current(last=last, capture_images=False)
         messages = [msg for _, msg, _ in _visible_observation_fingerprints(fresh.get("messages") or [])]
         if [_snapshot_match_key(msg) for msg in messages] != [_snapshot_match_key(msg) for _, msg, _ in candidates]:
             raise MediaCapturePending("media_snapshot_changed")
@@ -388,7 +390,10 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
     if not all(visible(item) for item in missing) or (native_row and not has_pixels):
         if not native_row:
             raise MediaCapturePending("media_not_visible")
-        macos_backend.reveal_chat_row(native_row, last=last)
+        if snapshot_reader and callable(getattr(snapshot_reader, 'reveal', None)):
+            snapshot_reader.reveal(expected_row_id)
+        else:
+            macos_backend.reveal_chat_row(native_row, last=last)
         # Scrolling can load history or coincide with new arrivals. Revalidate the
         # entire ordered snapshot before using any new click coordinates.
         messages = checked_snapshot()
@@ -423,7 +428,7 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
     return {"media": captured, "direction_evidence": messages[index].get("direction_evidence") or {}}
 
 
-def _prepare_snapshot_media(row, candidates, index, entry, existing, budget):
+def _prepare_snapshot_media(row, candidates, index, entry, existing, budget, *, snapshot_reader=None):
     message = candidates[index][1]
     media = [dict(item) for item in message.get("media") or []]
     direction_evidence = {}
@@ -450,7 +455,8 @@ def _prepare_snapshot_media(row, candidates, index, entry, existing, budget):
         try:
             with budget.capture(len(selected)):
                 edge_message_ledger.verify_media_identity(entry, message)
-                capture = _capture_snapshot_image(row, candidates, index, selected, entry=entry)
+                capture = _capture_snapshot_image(row, candidates, index, selected, entry=entry,
+                    **({'snapshot_reader': snapshot_reader} if snapshot_reader else {}))
             captured = capture["media"]
             direction_evidence = capture["direction_evidence"]
             if len(captured) != len(selected):
@@ -471,8 +477,7 @@ def _prepare_snapshot_media(row, candidates, index, entry, existing, budget):
     return {**message, "media": media, "direction_evidence": direction_evidence}
 
 
-def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, candidates, *, bootstrap_recent_count=0, media_budget=None):
-    media_budget = media_budget or MediaCaptureBudget()
+def _snapshot_descriptors(conversation_key, candidates):
     descriptors = []
     for fingerprint, message, position in candidates:
         media = [{"type": item["type"], "sha256": item["sha256"]}
@@ -484,11 +489,19 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
             "message": message,
             "media_only": bool(media) and _message_text(message) in {"[图片]", ""},
         })
+    return descriptors
+
+
+def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, candidates, *,
+                              bootstrap_recent_count=0, media_budget=None, recovery_id='', snapshot_reader=None):
+    media_budget = media_budget or MediaCaptureBudget()
+    descriptors = _snapshot_descriptors(conversation_key, candidates)
     captured = pending_direction = pending_media = 0
     # Reserve durable identities first; slow GUI capture must not hold a DB lock.
     with edge_message_ledger.transaction() as conn:
         entries, reason = edge_message_ledger.prepare(
             conn, conversation_key, descriptors, bootstrap_recent_count=bootstrap_recent_count,
+            **({'recovery_id': recovery_id} if recovery_id else {}),
         )
         if reason == "message_alignment_pending":
             return {"ok": False, "captured": 0, "reason": reason, "pending_alignment": 1}
@@ -563,8 +576,12 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
     for entry, message, position, index, existing in media_work:
         if not message.get("media") or _has_unsupported_media(message):
             continue
-        enriched = _prepare_snapshot_media(row, candidates, index, entry, existing, media_budget)
+        enriched = _prepare_snapshot_media(row, candidates, index, entry, existing, media_budget,
+            **({'snapshot_reader': snapshot_reader} if snapshot_reader else {}))
         if enriched is None:
+            event = edge_state.inbound_by_key(f'{conversation_key}:{entry["event_hash"]}')
+            if event:
+                edge_state.wait_for_inbound_media(event['client_event_id'])
             pending_media += 1
             continue
         with edge_message_ledger.transaction() as conn:
@@ -587,6 +604,8 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
             direction = event["payload"]["message"]["direction"]
             edge_message_ledger.mark(conn, entry, direction=direction,
                                      status="pending_direction" if direction == "unknown" else "captured")
+    if recovery_id:
+        recovery_state.link_messages(recovery_id, entries)
     return {"ok": True, "captured": captured, "pending_direction": pending_direction,
             "pending_media": pending_media,
             "baseline": all(entry["capture_status"] == "baseline" for entry in entries)}
@@ -613,6 +632,9 @@ def _event_for_upload(payload: dict) -> dict:
 def flush_inbound(client: edge_channel.ChannelClient) -> dict:
     delivered = failed = 0
     for event in edge_state.due_inbound():
+        if (event['payload']['message'].get('source', {}).get('recovery_id')
+                and not getattr(client, 'supports_history_recovery', False)):
+            continue
         # A server rollback or lost heartbeat must not send a registered placeholder
         # through the old duplicate path, which cannot attach its missing files.
         if event["registration_started"] and not getattr(client, "supports_deferred_media", False):
@@ -639,6 +661,9 @@ def flush_registrations(client: edge_channel.ChannelClient) -> dict:
     if not getattr(client, "supports_deferred_media", False):
         return {"registered": 0, "failed": 0}
     for event in edge_state.due_registrations():
+        if (event['payload']['message'].get('source', {}).get('recovery_id')
+                and not getattr(client, 'supports_history_recovery', False)):
+            continue
         try:
             edge_state.start_registration(event["client_event_id"])
             result = client.register_message(_event_for_upload(event["payload"]))
@@ -803,6 +828,8 @@ def _wait_for_media_command_echoes(row: dict, before: list[dict], text: str, ima
 
 def execute_command(client: edge_channel.ChannelClient, command: dict, *, last: int = 20) -> dict:
     """Execute one command at most once; uncertain sends become reconciliation."""
+    if recovery_state.active():
+        return {"status": "precondition_failed", "reason": "history_recovery_requested"}
     command_id = str(command["command_id"])
     if _command_expired(command):
         return {"status": "precondition_failed", "reason": "command_expired"}
@@ -828,13 +855,18 @@ def execute_command(client: edge_channel.ChannelClient, command: dict, *, last: 
                 return {"status": "precondition_failed", "reason": f"command_media_download_failed:{type(exc).__name__}"}
             before_outbound_replies = _visible_outbound_reply_count(before.get("messages") or [], text)
             try:
-                reply.send_message(
-                    text,
-                    attachments=attachments,
-                    dry_run=False,
-                    submit=True,
-                    allow_clipboard_fallback=False,
-                )
+                # Serialize the final gate and physical send with recovery controls.
+                # Release before echo verification so an accepted send can finish checking.
+                with recovery_state.control_lock():
+                    if recovery_state.active():
+                        return {"status": "precondition_failed", "reason": "history_recovery_requested"}
+                    reply.send_message(
+                        text,
+                        attachments=attachments,
+                        dry_run=False,
+                        submit=True,
+                        allow_clipboard_fallback=False,
+                    )
             except Exception as exc:
                 if isinstance(exc, macos_backend.TextSendError) and exc.submitted is False:
                     return {"status": "precondition_failed", "reason": f"text_send:{exc.reason_code}"}
@@ -924,6 +956,15 @@ def flush_command_results(client: edge_channel.ChannelClient) -> dict:
 
 
 def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) -> dict:
+    if recovery_state.active():
+        from cli_anything.wecom_gui.core import history_recovery
+        client = edge_channel.ChannelClient(edge_channel.ChannelConfig.from_env())
+        try:
+            client.heartbeat()
+        except Exception as exc:
+            runtime_reporting.publish('edge_channel', status='retrying', phase='recovery_network_retry', error_code=type(exc).__name__)
+            return {'ok': False, 'recovery': recovery_state.snapshot()}
+        return history_recovery.step(client)
     runtime_reporting.publish(
         "edge_channel",
         status="running",
@@ -973,6 +1014,8 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
                               metrics={"pending_alignment": pending_alignment},
                               error_code="message_alignment_pending" if pending_alignment else "")
     try:
+        if recovery_state.active():
+            return {'ok': True, 'recovery': recovery_state.snapshot()}
         command = client.pull_command(wait_seconds=pull_wait_seconds)
         if command:
             runtime_reporting.publish(
@@ -984,7 +1027,8 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
             )
             inserted, receipt = edge_state.record_command(command)
             if inserted and edge_state.mark_command_executing(receipt["command_id"]):
-                command_result = execute_command(client, command, last=last)
+                command_result = ({'status': 'precondition_failed', 'reason': 'history_recovery_requested'}
+                                  if recovery_state.active() else execute_command(client, command, last=last))
                 edge_state.save_command_result(receipt["command_id"], command_result)
                 if command_result.get("status") == "succeeded":
                     conversation = command.get("conversation") if isinstance(command.get("conversation"), dict) else {}
@@ -1036,7 +1080,23 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
     }
 
 
+@contextmanager
+def worker_lock():
+    with (state.state_dir() / 'edge-worker.lock').open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('edge worker is already running') from None
+        yield
+
+
+def run_once(*, inbox_limit: int = 30, last: int = 20) -> dict:
+    with worker_lock():
+        return tick(inbox_limit=inbox_limit, last=last)
+
+
 def run_forever(*, poll_seconds: float = 1.0, inbox_limit: int = 30, last: int = 20) -> None:
-    while True:
-        tick(inbox_limit=inbox_limit, last=last, pull_wait_seconds=25)
-        time.sleep(max(0.1, poll_seconds))
+    with worker_lock():
+        while True:
+            tick(inbox_limit=inbox_limit, last=last, pull_wait_seconds=25)
+            time.sleep(max(0.1, poll_seconds))

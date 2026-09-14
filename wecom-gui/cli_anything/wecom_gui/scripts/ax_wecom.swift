@@ -322,6 +322,14 @@ func singleChatRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
     }
 }
 
+func singleChatPreparationResult(selectedBefore: Bool, rowAfter: [String: Any]?) -> [String: Any] {
+    let identified = (rowAfter?["texts"] as? [String] ?? []).contains("单聊")
+    let selectedAfter = identified && rowAfter?["selected"] as? Bool == true
+    return ["ok": selectedAfter, "selectedBefore": selectedBefore, "selectedAfter": selectedAfter,
+            "reason": selectedAfter ? "" : (identified ? "single_chat_not_selected" : "single_chat_row_not_found"),
+            "row": rowAfter ?? [:]]
+}
+
 func ensureSingleChat(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
     guard let row = singleChatRow(root: root, window: window) else {
         return ["ok": false, "error": "single_chat_row_not_found"]
@@ -339,11 +347,8 @@ func ensureSingleChat(root: AXUIElement, window: AXUIElement?) -> [String: Any] 
         }
         Thread.sleep(forTimeInterval: 0.18)
     }
-    return [
-        "ok": true,
-        "selectedBefore": selected,
-        "row": payload
-    ]
+    let after = singleChatRow(root: root, window: mainWindow(root)).map { rowPayload($0, index: 1) }
+    return singleChatPreparationResult(selectedBefore: selected, rowAfter: after)
 }
 
 func collectTextElements(_ element: AXUIElement, out: inout [[String: Any]], maxDepth: Int = 10, depth: Int = 0) {
@@ -835,7 +840,8 @@ func chatWindowIndices(rowCount: Int, last: Int) -> Range<Int> {
 }
 
 func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, window: AXUIElement?,
-                            table: AXUIElement?, selected: AXUIElement?, last: Int) -> [[String: Any]] {
+                            table: AXUIElement?, selected: AXUIElement?, last: Int,
+                            cursor: [String: Any]? = nil) -> [[String: Any]] {
     func unverified(_ reason: String) -> [[String: Any]] {
         return payloads.map { item in
             var result = item
@@ -846,6 +852,10 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     guard #available(macOS 14.0, *) else { return unverified("macos_14_required") }
     guard CGPreflightScreenCaptureAccess() else { return unverified("screen_capture_permission_required") }
     guard let window = window, let windowPayload = rectPayload(window) else { return unverified("window_unavailable") }
+    if let cursor = cursor,
+       (cursor["scope"] as? [String: String])?["window_id"] != captureRowIdentity(window) {
+        return unverified("recovery_window_changed")
+    }
     let windowRect = cgRect(windowPayload)
     guard payloads.contains(where: hasVisibleDirectionBody) else { return unverified("no_visible_message_bubbles") }
     let selectedBefore = selected.map { collectText($0) } ?? []
@@ -885,17 +895,28 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
           case .success(let image) = captured else {
         return unverified("capture_failed_or_timed_out")
     }
-    let after = table.map { children($0).filter { role($0) == "AXRow" } } ?? []
-    let viewportAfter = table.flatMap { ancestorRect($0, matchingRole: "AXScrollArea") }
-    let afterPayloads = measured("revalidate_rows") {
-        chatWindowIndices(rowCount: after.count, last: last).map {
-            chatPayload(after[$0], index: $0 + 1, viewport: viewportAfter)
+    let afterPayloads: [[String: Any]]
+    if let cursor = cursor {
+        do {
+            let snapshot = try recoverySnapshot(root: root, kind: "chat")
+            afterPayloads = try recoveryCaptureRows(cursor: cursor, before: payloads, snapshot: snapshot, size: last)
+        } catch let error as RecoveryError {
+            return unverified("recovery_" + error.reason)
+        } catch { return unverified("recovery_capture_validation_failed") }
+    } else {
+        let after = table.map { children($0).filter { role($0) == "AXRow" } } ?? []
+        let viewportAfter = table.flatMap { ancestorRect($0, matchingRole: "AXScrollArea") }
+        afterPayloads = measured("revalidate_rows") {
+            chatWindowIndices(rowCount: after.count, last: last).map {
+                chatPayload(after[$0], index: $0 + 1, viewport: viewportAfter)
+            }
         }
     }
     let selectedAfter = selected.map { rowPayload($0, index: 0) } ?? [:]
-    guard !selectedBefore.isEmpty, selectedBefore == selectedAfter["texts"] as? [String],
-          selectedAfter["selected"] as? Bool == true, rectPayload(window) == windowPayload,
-          chatSnapshotsMatch(payloads, afterPayloads) else {
+    let selectionMatches = cursor != nil || (!selectedBefore.isEmpty && selectedBefore == selectedAfter["texts"] as? [String]
+        && selectedAfter["selected"] as? Bool == true)
+    guard selectionMatches, rectPayload(window) == windowPayload,
+          cursor != nil || chatSnapshotsMatch(payloads, afterPayloads) else {
         if profileChatRead {
             let fields = Set(zip(payloads, afterPayloads).flatMap { before, after in
                 Set(before.keys).union(after.keys).filter { key in
@@ -914,6 +935,12 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
         }
         return unverified("chat_changed_during_capture")
     }
+    return applyBubbleDirections(cursor == nil ? payloads : afterPayloads, image: image,
+                                 windowRect: windowRect, windowID: target.windowID)
+}
+
+func applyBubbleDirections(_ payloads: [[String: Any]], image: CGImage,
+                           windowRect: CGRect, windowID: CGWindowID) -> [[String: Any]] {
     var cachedViewport: CGRect?
     var boxes: [CGRect] = []
     var imageBoxes: [CGRect]?
@@ -948,7 +975,7 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
         } else {
             evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
         }
-        evidence["windowId"] = target.windowID
+        evidence["windowId"] = windowID
         result["directionEvidence"] = evidence
         return result
     }
@@ -1847,6 +1874,481 @@ func sidebarIdentityPayload(root: AXUIElement, window: AXUIElement?) -> [String:
     ]
 }
 
+// Recovery cursors contain process-scoped AX identities, never server message IDs.
+struct RecoveryError: Error {
+    let reason: String
+}
+
+func recoveryHash(_ value: Any) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return "" }
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func recoveryRowDigest(_ payload: [String: Any]) -> String {
+    let media = (payload["mediaElements"] as? [[String: Any]] ?? []).map { item in
+        ["type": item["mediaType"] ?? item["type"] ?? "", "texts": item["texts"] ?? []] as [String: Any]
+    }
+    // Coordinates and absolute indices change when history is prepended or a row is revealed.
+    return recoveryHash(["texts": payload["texts"] ?? [], "messageTexts": payload["messageTexts"] ?? [],
+                         "timestampText": payload["timestampText"] ?? "", "media": media])
+}
+
+struct RecoverySnapshot {
+    let scope: [String: String]
+    let conversation: [String: Any]
+    let ids: [String]
+    let visible: [Int]
+    let bottomVerified: Bool
+    let payloads: (Range<Int>) -> [[String: Any]]
+    var topVerified: Bool = false
+    var fullyVisible: [Int] = []
+    var table: AXUIElement? = nil
+    var scrollArea: AXUIElement? = nil
+    var rows: [AXUIElement] = []
+}
+
+func recoveryCheckScope(_ expected: [String: String], _ actual: [String: String]) throws {
+    for key in ["window_id", "conversation_id", "table_id", "kind"] where expected[key] != actual[key] {
+        throw RecoveryError(reason: key == "kind" ? "cursor_kind_mismatch" : key.replacingOccurrences(of: "_id", with: "_changed"))
+    }
+}
+
+func recoveryResolve(_ cursor: [String: Any], in snapshot: RecoverySnapshot, size: Int) throws -> Range<Int> {
+    guard cursor["version"] as? Int == 1, cursor["page_size"] as? Int == size,
+          let scope = cursor["scope"] as? [String: String],
+          let anchors = cursor["anchors"] as? [[String: String]], !anchors.isEmpty, anchors.count <= size,
+          anchors.allSatisfy({ !($0["id"] ?? "").isEmpty && !($0["digest"] ?? "").isEmpty }) else {
+        throw RecoveryError(reason: "invalid_cursor")
+    }
+    try recoveryCheckScope(scope, snapshot.scope)
+    let ids = anchors.map { $0["id"]! }
+    let starts = snapshot.ids.indices.filter { snapshot.ids[$0] == ids[0] }
+    guard starts.count == 1, let start = starts.first else {
+        throw RecoveryError(reason: starts.isEmpty ? "cursor_anchor_missing" : "cursor_anchor_ambiguous")
+    }
+    let end = start + ids.count
+    guard end <= snapshot.ids.count, Array(snapshot.ids[start..<end]) == ids else {
+        throw RecoveryError(reason: "cursor_sequence_changed")
+    }
+    guard snapshot.payloads(start..<end).map(recoveryRowDigest) == anchors.map({ $0["digest"]! }) else {
+        throw RecoveryError(reason: "cursor_content_changed")
+    }
+    return start..<end
+}
+
+func recoveryRange(action: String, count: Int, size: Int, previous: Range<Int>?, visible: [Int]) -> Range<Int> {
+    let overlap = min(5, max(0, size - 1), previous?.count ?? size)
+    switch action {
+    case "latest": return max(0, count - size)..<count
+    case "top": return 0..<min(size, count)
+    case "older":
+        guard let old = previous, old.lowerBound > 0 else { return previous ?? 0..<0 }
+        let end = old.lowerBound + overlap
+        return max(0, end - size)..<end
+    case "newer", "next":
+        if let old = previous {
+            guard old.upperBound < count else { return old }
+            let start = old.upperBound - overlap
+            return start..<min(count, start + size)
+        }
+        let start = visible.first ?? 0
+        return start..<min(count, start + size)
+    default:
+        if let old = previous { return old }
+        let start = visible.first ?? 0
+        return start..<min(count, start + size)
+    }
+}
+
+func recoveryCursor(_ snapshot: RecoverySnapshot, range: Range<Int>, size: Int,
+                    payloads: [[String: Any]]) -> [String: Any] {
+    let anchors = zip(range, payloads).map { index, payload in
+        ["id": snapshot.ids[index], "digest": recoveryRowDigest(payload)]
+    }
+    return ["version": 1, "page_size": size, "scope": snapshot.scope, "anchors": anchors,
+            "row_offset": range.lowerBound]
+}
+
+func recoveryProgressToken(_ cursor: [String: Any]) -> String {
+    var identity = cursor
+    identity.removeValue(forKey: "row_offset")
+    return recoveryHash(identity)
+}
+
+func recoveryCaptureRows(cursor: [String: Any], before: [[String: Any]],
+                         snapshot: RecoverySnapshot, size: Int) throws -> [[String: Any]] {
+    guard (1...20).contains(size), !before.isEmpty, before.count <= size else {
+        throw RecoveryError(reason: "invalid_capture_window")
+    }
+    let range = try recoveryResolve(cursor, in: snapshot, size: size)
+    let after = snapshot.payloads(range)
+    func comparable(_ rows: [[String: Any]]) -> [[String: Any]] {
+        rows.map { item in
+            var row = item
+            for key in ["index", "snapshotComplete", "directionEvidence"] { row.removeValue(forKey: key) }
+            return row
+        }
+    }
+    guard chatSnapshotsMatch(comparable(before), comparable(after)) else {
+        throw RecoveryError(reason: "chat_changed_during_capture")
+    }
+    return after
+}
+
+func recoveryChatDirections(_ page: [String: Any], read: () throws -> RecoverySnapshot,
+                            verify: ([[String: Any]], [String: Any], Int) -> [[String: Any]]) -> [String: Any] {
+    guard page["ok"] as? Bool == true, let cursor = page["cursor"] as? [String: Any],
+          let size = cursor["page_size"] as? Int, let rows = page["rows"] as? [[String: Any]] else { return page }
+    var result = page
+    do {
+        let evidenceRows = verify(rows, cursor, size)
+        for row in evidenceRows {
+            let status = (row["directionEvidence"] as? [String: Any])?["status"] as? String ?? ""
+            if status.hasPrefix("recovery_") { throw RecoveryError(reason: String(status.dropFirst("recovery_".count))) }
+            if status == "chat_changed_during_capture" { throw RecoveryError(reason: status) }
+        }
+        let snapshot = try read()
+        result["observed_scope"] = snapshot.scope
+        result["observed_conversation"] = snapshot.conversation
+        let current = try recoveryCaptureRows(cursor: cursor, before: evidenceRows, snapshot: snapshot, size: size)
+        let range = try recoveryResolve(cursor, in: snapshot, size: size)
+        let updatedCursor = recoveryCursor(snapshot, range: range, size: size, payloads: current)
+        result["rows"] = zip(current, evidenceRows).map { payload, evidence in
+            var row = payload
+            row["directionEvidence"] = evidence["directionEvidence"]
+            return row
+        }
+        result["cursor"] = updatedCursor
+        result["progress_token"] = recoveryProgressToken(updatedCursor)
+        result["row_offset"] = range.lowerBound
+        result["loaded_at_start"] = range.lowerBound == 0
+        result["loaded_at_end"] = range.upperBound == snapshot.ids.count
+        result["exposed_row_count"] = snapshot.ids.count
+        result["at_latest"] = page["at_latest"] as? Bool == true && range.upperBound == snapshot.ids.count && snapshot.bottomVerified
+    } catch {
+        result.merge(["ok": false, "gap": true, "rows": [], "cursor": NSNull(), "progress_token": "",
+            "at_start": false, "at_latest": false, "at_end": false,
+            "reason": (error as? RecoveryError)?.reason ?? "capture_validation_failed"]) { _, new in new }
+    }
+    return result
+}
+
+func recoveryPage(kind: String, action: String, size: Int, cursor: [String: Any]?,
+                  read: () throws -> RecoverySnapshot,
+                  move: (RecoverySnapshot, Int, String, Bool) -> String,
+                  settle: () -> Void = {}) -> [String: Any] {
+    var result: [String: Any] = ["ok": false, "reason": "", "gap": true, "rows": [], "cursor": NSNull(),
+        "at_start": false, "at_end": false, "at_latest": false, "progress_token": "", "moved": false,
+        "action": action, "boundary_scope": "currently_exposed_ax_rows", "history_boundary_verified": false]
+    do {
+        let allowed = kind == "chat" ? ["latest", "older", "newer", "current"] : ["top", "next", "current"]
+        guard allowed.contains(action), (1...20).contains(size) else { throw RecoveryError(reason: "invalid_recovery_request") }
+        if kind == "chat", action != "latest", cursor == nil { throw RecoveryError(reason: "cursor_required") }
+        let before = try read()
+        result.merge(before.scope) { _, new in new }
+        result["conversation"] = before.conversation
+        let reset = action == "latest" || action == "top"
+        var activeCursor = reset ? nil : cursor
+        var previous = try activeCursor.map { try recoveryResolve($0, in: before, size: size) }
+        if kind == "inbox", action == "next", previous == nil {
+            previous = recoveryRange(action: "current", count: before.ids.count, size: size, previous: nil, visible: before.visible)
+            activeCursor = recoveryCursor(before, range: previous!, size: size, payloads: before.payloads(previous!))
+        }
+        let requested = recoveryRange(action: action, count: before.ids.count, size: size, previous: previous, visible: before.visible)
+        guard !requested.isEmpty else { throw RecoveryError(reason: "rows_unavailable") }
+        let backwards = action == "older" || action == "top"
+        let edge = action == "latest" || action == "top"
+            || (action == "older" && previous?.lowerBound == 0)
+            || (["newer", "next"].contains(action) && previous?.upperBound == before.ids.count)
+        var method = "none"
+        if action != "current" {
+            method = move(before, backwards ? requested.lowerBound : requested.upperBound - 1,
+                          backwards ? "up" : "down", edge)
+            settle()
+        }
+        let after = try read()
+        result["observed_scope"] = after.scope
+        result["observed_conversation"] = after.conversation
+        try recoveryCheckScope(before.scope, after.scope)
+        let relocated = try activeCursor.map { try recoveryResolve($0, in: after, size: size) }
+        let range = recoveryRange(action: action, count: after.ids.count, size: size, previous: relocated, visible: after.visible)
+        guard !range.isEmpty else { throw RecoveryError(reason: "rows_unavailable") }
+        let payloads = after.payloads(range)
+        let nextCursor = recoveryCursor(after, range: range, size: size, payloads: payloads)
+        // A second observation detects asynchronous loading, selection changes and AX row recycling.
+        if action != "current" { settle() }
+        let verified = try read()
+        result.merge(verified.scope) { _, new in new }
+        result["conversation"] = verified.conversation
+        let verifiedRange = try recoveryResolve(nextCursor, in: verified, size: size)
+        let output = verified.payloads(verifiedRange)
+        let finalCursor = recoveryCursor(verified, range: verifiedRange, size: size, payloads: output)
+        let progressed = activeCursor.map { recoveryProgressToken($0) != recoveryProgressToken(finalCursor) } ?? false
+        let stableInventory = after.ids == verified.ids
+        let atBottom = verifiedRange.upperBound == verified.ids.count && verified.bottomVerified && stableInventory
+        let atTop = verifiedRange.lowerBound == 0 && verified.topVerified && stableInventory
+        var reason = ""
+        if method == "targeted_scroll_unavailable" { reason = method }
+        if action != "current", !verified.visible.contains(backwards ? verifiedRange.lowerBound : verifiedRange.upperBound - 1) {
+            reason = "target_row_not_visible"
+        }
+        if kind == "chat", verifiedRange.lowerBound == 0 { reason = "history_boundary_unverified" }
+        if ["newer", "next"].contains(action), !progressed, !atBottom { reason = "list_boundary_unverified" }
+        if action == "latest", !atBottom { reason = "latest_boundary_unverified" }
+        if action == "top", !atTop { reason = "top_boundary_unverified" }
+        if kind == "inbox", verifiedRange.upperBound == verified.ids.count, !atBottom { reason = "list_boundary_unverified" }
+        result.merge(["ok": true, "reason": reason,
+            "single_chat_verified": kind == "inbox",
+            "gap": !reason.isEmpty && (!progressed || ["target_row_not_visible", "targeted_scroll_unavailable"].contains(reason)),
+            "rows": output, "cursor": finalCursor, "progress_token": recoveryProgressToken(finalCursor),
+            "moved": progressed, "scroll_method": method, "at_end": kind == "inbox" && atBottom,
+            "at_latest": kind == "chat" && atBottom, "at_top": kind == "inbox" && atTop,
+            "loaded_at_start": verifiedRange.lowerBound == 0,
+            "loaded_at_end": verifiedRange.upperBound == verified.ids.count, "row_offset": verifiedRange.lowerBound,
+            "row_count": output.count, "exposed_row_count": verified.ids.count]) { _, new in new }
+    } catch let error as RecoveryError {
+        result["reason"] = error.reason
+    } catch {
+        result["reason"] = "recovery_ax_failed"
+    }
+    return result
+}
+
+func recoveryElements(_ element: AXUIElement, attribute: CFString, maximum: Int) throws -> [AXUIElement] {
+    var count: CFIndex = 0
+    guard AXUIElementGetAttributeValueCount(element, attribute, &count) == .success else {
+        throw RecoveryError(reason: "ax_rows_unavailable")
+    }
+    guard count <= maximum else { throw RecoveryError(reason: "ax_scan_limit_exceeded") }
+    if count == 0 { return [] }
+    var values: CFArray?
+    guard AXUIElementCopyAttributeValues(element, attribute, 0, count, &values) == .success,
+          let elements = values as? [AXUIElement] else { throw RecoveryError(reason: "ax_rows_unavailable") }
+    return elements
+}
+
+func recoveryRows(_ table: AXUIElement) throws -> [AXUIElement] {
+    do { return try recoveryElements(table, attribute: kAXRowsAttribute as CFString, maximum: 4096) }
+    catch let error as RecoveryError where error.reason == "ax_rows_unavailable" {
+        return try recoveryElements(table, attribute: kAXChildrenAttribute as CFString, maximum: 4096).filter { role($0) == "AXRow" }
+    }
+}
+
+func recoveryNumber(_ element: AXUIElement, _ attribute: CFString) -> Double? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+          let number = value as? NSNumber, number.doubleValue.isFinite else { return nil }
+    return number.doubleValue
+}
+
+func recoveryScrollbar(_ area: AXUIElement) -> AXUIElement? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(area, kAXVerticalScrollBarAttribute as CFString, &value) == .success,
+          let element = value, CFGetTypeID(element) == AXUIElementGetTypeID() else { return nil }
+    return (element as! AXUIElement)
+}
+
+func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapshot {
+    guard let window = mainWindow(root), let frame = rectPayload(window) else { throw RecoveryError(reason: "window_unavailable") }
+    var tables: [AXUIElement] = []
+    var visited = 0
+    func walk(_ node: AXUIElement, depth: Int) throws {
+        visited += 1
+        guard visited <= 2048, depth <= 14 else { throw RecoveryError(reason: "ax_scan_limit_exceeded") }
+        let nodeRole = role(node)
+        if nodeRole == "AXTable" { tables.append(node); return }
+        if nodeRole == "AXWebArea" { return }
+        let descendants: [AXUIElement]
+        do { descendants = try recoveryElements(node, attribute: kAXChildrenAttribute as CFString, maximum: 2048) }
+        catch let error as RecoveryError where error.reason == "ax_rows_unavailable" { return }
+        for child in descendants {
+            try walk(child, depth: depth + 1)
+        }
+    }
+    try walk(window, depth: 0)
+    let listRight = frame["x", default: 0] + min(frame["width", default: 0] * 0.46, 760)
+    if kind == "inbox" {
+        var singleRows: [AXUIElement] = []
+        for table in tables {
+            guard let rect = rectPayload(table), rect["x", default: 0] < listRight else { continue }
+            let rows = try recoveryRows(table)
+            // Limit navigation label inspection to small tables.
+            guard rows.count <= 8 else { continue }
+            let texts = rows.map { collectText($0, maxDepth: 4) }
+            let labels = texts.flatMap { $0 }
+            guard labels.contains("单聊"), labels.contains(where: { ["群聊", "@我", "未读", "内部聊天"].contains($0) }) else { continue }
+            singleRows += rows.indices.filter { texts[$0].contains("单聊") }.map { rows[$0] }
+        }
+        guard singleRows.count == 1, recoveryNumber(singleRows[0], kAXSelectedAttribute as CFString) == 1 else {
+            throw RecoveryError(reason: "single_chat_not_selected")
+        }
+    }
+    var lists: [AXUIElement] = []
+    for table in tables {
+        guard let rect = rectPayload(table), rect["width", default: 0] >= 220,
+              rect["width", default: 0] <= 680, rect["x", default: 0] + rect["width", default: 0] <= listRight else { continue }
+        let sample = try recoveryRows(table).prefix(5).flatMap { collectText($0, maxDepth: 4) }
+        if !sample.contains("单聊") && !sample.contains("群聊") && !sample.contains("内部聊天") { lists.append(table) }
+    }
+    guard lists.count == 1, let list = lists.first, let listRect = rectPayload(list) else {
+        throw RecoveryError(reason: lists.isEmpty ? "inbox_table_unavailable" : "inbox_table_ambiguous")
+    }
+    var conversation: [String: Any] = [:]
+    let listRows = try recoveryRows(list)
+    let selectedRows = (try? recoveryElements(list, attribute: kAXSelectedRowsAttribute as CFString, maximum: 2)) ?? listRows.filter {
+        recoveryNumber($0, kAXSelectedAttribute as CFString) == 1
+    }
+    if selectedRows.count == 1, let selected = selectedRows.first {
+        conversation = rowPayload(selected, index: (listRows.firstIndex(of: selected) ?? 0) + 1)
+        let texts = (conversation["texts"] as? [String] ?? []).filter { !$0.hasPrefix("icon ") && !$0.hasPrefix("avatar ") }
+        let rowID = captureRowIdentity(selected)
+        conversation["capture_row_id"] = rowID
+        conversation["title"] = texts.first ?? ""
+        conversation["id"] = rowID.isEmpty ? "" : recoveryHash([rowID, texts.first ?? "", texts.filter { $0.hasPrefix("@") }.joined(separator: "|")])
+    }
+    var table = list
+    if kind == "chat" {
+        guard !(conversation["id"] as? String ?? "").isEmpty else { throw RecoveryError(reason: "conversation_unverified") }
+        let candidates = tables.filter { candidate in
+            guard !CFEqual(candidate, list), let rect = rectPayload(candidate),
+                  let viewport = ancestorRect(candidate, matchingRole: "AXScrollArea") else { return false }
+            return rect["x", default: 0] >= listRect["x", default: 0] + listRect["width", default: 0] - 4
+                && viewport["width", default: 0] >= 240
+        }
+        guard candidates.count == 1 else { throw RecoveryError(reason: candidates.isEmpty ? "chat_table_unavailable" : "chat_table_ambiguous") }
+        table = candidates[0]
+    }
+    guard let area = ancestorElement(table, matchingRole: "AXScrollArea"), let viewport = rectPayload(area) else {
+        throw RecoveryError(reason: "scroll_area_unavailable")
+    }
+    let rows = try recoveryRows(table)
+    let ids = rows.map(captureRowIdentity)
+    guard !ids.isEmpty else { throw RecoveryError(reason: "rows_unavailable") }
+    guard ids.allSatisfy({ !$0.isEmpty }), Set(ids).count == ids.count else { throw RecoveryError(reason: "ax_row_identity_unverified") }
+    let tableID = captureRowIdentity(table), windowID = captureRowIdentity(window)
+    guard !tableID.isEmpty, !windowID.isEmpty else { throw RecoveryError(reason: "ax_scope_identity_unverified") }
+    let visible = rows.indices.filter { index in
+        guard let rect = rectPayload(rows[index]) else { return false }
+        let bounds = cgRect(rect)
+        return bounds.width > 0 && bounds.height > 0 && cgRect(viewport).intersects(bounds)
+    }
+    var bottom = false
+    var top = false
+    if let bar = recoveryScrollbar(area), let value = recoveryNumber(bar, kAXValueAttribute as CFString),
+       let minimum = recoveryNumber(bar, kAXMinValueAttribute as CFString),
+       let maximum = recoveryNumber(bar, kAXMaxValueAttribute as CFString), maximum > minimum,
+       let last = rows.last.flatMap({ rectPayload($0) }), let first = rows.first.flatMap({ rectPayload($0) }),
+       recoveryNumber(table, kAXRowCountAttribute as CFString) == Double(rows.count) {
+        bottom = abs(value - maximum) <= (maximum - minimum) * 0.000001 && cgRect(viewport).contains(cgRect(last))
+        top = abs(value - minimum) <= (maximum - minimum) * 0.000001 && cgRect(viewport).contains(cgRect(first))
+    }
+    return RecoverySnapshot(scope: ["kind": kind, "table_id": tableID, "window_id": windowID,
+        "conversation_id": kind == "chat" ? conversation["id"] as? String ?? "" : ""],
+        conversation: conversation, ids: ids, visible: visible, bottomVerified: bottom, payloads: { range in
+            range.map { index in
+                var payload = kind == "chat" ? chatPayload(rows[index], index: index + 1, viewport: viewport)
+                    : recentRowPayload(rows[index], index: index + 1, minutes: 0)
+                payload["captureRowId"] = ids[index]
+                payload["snapshotComplete"] = true
+                return payload
+            }
+        }, topVerified: top, fullyVisible: rows.indices.filter { index in
+            guard let rect = rectPayload(rows[index]) else { return false }
+            return cgRect(rect).height > 0 && cgRect(viewport).insetBy(dx: 0, dy: 4).contains(cgRect(rect))
+        }, table: table, scrollArea: area, rows: rows)
+}
+
+func recoveryReveal(row: Int, cursor: [String: Any]?, size: Int,
+                    read: () throws -> RecoverySnapshot,
+                    move: (RecoverySnapshot, Int, String, Bool) -> String,
+                    settle: () -> Void = {}) -> [String: Any] {
+    var result: [String: Any] = ["ok": false, "gap": true, "reason": "", "cursor": NSNull(),
+                               "progress_token": "", "changed": false]
+    do {
+        guard (1...20).contains(size), row > 0 else { throw RecoveryError(reason: "invalid_recovery_request") }
+        guard let cursor = cursor else { throw RecoveryError(reason: "cursor_required") }
+        guard (cursor["scope"] as? [String: String])?["kind"] == "chat" else { throw RecoveryError(reason: "cursor_kind_mismatch") }
+        guard let offset = cursor["row_offset"] as? Int, offset >= 0 else {
+            throw RecoveryError(reason: "cursor_row_mapping_missing")
+        }
+        let position = row - 1 - offset
+        var snapshot = try read()
+        var range = try recoveryResolve(cursor, in: snapshot, size: size)
+        guard position >= 0, position < range.count else { throw RecoveryError(reason: "row_outside_cursor") }
+        let targetID = snapshot.ids[range.lowerBound + position]
+        result["capture_row_id"] = targetID
+        var method = "already_visible"
+        for _ in 0..<2 {
+            result.merge(snapshot.scope) { _, new in new }
+            result["conversation"] = snapshot.conversation
+            let index = range.lowerBound + position
+            if snapshot.fullyVisible.contains(index) { break }
+            let payload = snapshot.payloads(index..<index + 1)[0]
+            let viewport = payload["chatViewport"] as? [String: Double] ?? [:]
+            let direction = (payload["y"] as? Double ?? 0) < viewport["y", default: 0] + 4 ? "up" : "down"
+            method = move(snapshot, index, direction, false)
+            result["changed"] = method != "already_visible" && method != "targeted_scroll_unavailable"
+            settle()
+            snapshot = try read()
+            result["observed_scope"] = snapshot.scope
+            range = try recoveryResolve(cursor, in: snapshot, size: size)
+        }
+        let verified = try read()
+        result["observed_scope"] = verified.scope
+        let verifiedRange = try recoveryResolve(cursor, in: verified, size: size)
+        let index = verifiedRange.lowerBound + position
+        guard verified.ids[index] == targetID else { throw RecoveryError(reason: "cursor_sequence_changed") }
+        guard verified.fullyVisible.contains(index) else { throw RecoveryError(reason: "recovery_row_not_visible") }
+        let updatedCursor = recoveryCursor(verified, range: verifiedRange, size: size, payloads: verified.payloads(verifiedRange))
+        result.merge(verified.scope) { _, new in new }
+        result.merge(["ok": true, "gap": false, "reason": "", "row": index + 1,
+            "conversation": verified.conversation, "cursor": updatedCursor,
+            "progress_token": recoveryProgressToken(updatedCursor), "scroll_method": method]) { _, new in new }
+    } catch {
+        result["reason"] = (error as? RecoveryError)?.reason ?? "recovery_reveal_failed"
+    }
+    return result
+}
+
+func recoveryMove(_ snapshot: RecoverySnapshot, index: Int, direction: String, edge: Bool) -> String {
+    guard let table = snapshot.table, let area = snapshot.scrollArea, snapshot.rows.indices.contains(index) else {
+        return "targeted_scroll_unavailable"
+    }
+    let row = snapshot.rows[index]
+    if !edge {
+        if snapshot.fullyVisible.contains(index) { return "already_visible" }
+        if AXUIElementPerformAction(row, "AXScrollToVisible" as CFString) == .success { return "AXScrollToVisible" }
+    }
+    if let bar = recoveryScrollbar(area), let minimum = recoveryNumber(bar, kAXMinValueAttribute as CFString),
+       let maximum = recoveryNumber(bar, kAXMaxValueAttribute as CFString), maximum > minimum,
+       let current = recoveryNumber(bar, kAXValueAttribute as CFString) {
+        var target = direction == "up" ? minimum : maximum
+        if !edge {
+            guard let viewport = rectPayload(area), let rect = rectPayload(row),
+                  let first = snapshot.rows.first.flatMap({ rectPayload($0) }),
+                  let last = snapshot.rows.last.flatMap({ rectPayload($0) }) else { return "targeted_scroll_unavailable" }
+            let overflow = cgRect(last).maxY - cgRect(first).minY - cgRect(viewport).height
+            guard overflow > 0 else { return "targeted_scroll_unavailable" }
+            let delta = direction == "up" ? cgRect(rect).minY - cgRect(viewport).minY : cgRect(rect).maxY - cgRect(viewport).maxY
+            target = min(maximum, max(minimum, current + delta / overflow * (maximum - minimum)))
+        }
+        if abs(current - target) > (maximum - minimum) * 0.000001,
+           AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, NSNumber(value: target)) == .success {
+            return "AXScrollBar"
+        }
+    }
+    let action = direction == "up" ? "AXScrollUp" : "AXScrollDown"
+    for target in [area, table] {
+        var actions: CFArray?
+        if AXUIElementCopyActionNames(target, &actions) == .success,
+           (actions as? [String] ?? []).contains(action),
+           AXUIElementPerformAction(target, action as CFString) == .success { return action }
+    }
+    // Even at scrollbar minimum, revealing the first row may request a lazy history load.
+    if edge, AXUIElementPerformAction(row, "AXScrollToVisible" as CFString) == .success { return "AXScrollToVisible" }
+    return "targeted_scroll_unavailable"
+}
+
 func intArg(_ index: Int, defaultValue: Int) -> Int {
     if CommandLine.arguments.count > index, let value = Int(CommandLine.arguments[index]) {
         return value
@@ -1856,6 +2358,96 @@ func intArg(_ index: Int, defaultValue: Int) -> Int {
 
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : "rows"
+if command == "single-chat-fixture", args.count == 3 {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        guard let cases = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { exit(2) }
+        for item in cases {
+            jsonLine(singleChatPreparationResult(selectedBefore: item["selectedBefore"] as? Bool ?? false,
+                                                 rowAfter: item["rowAfter"] as? [String: Any]))
+        }
+        exit(0)
+    } catch { fputs("Invalid single chat fixture\n", stderr); exit(2) }
+}
+if command == "recovery-fixture", args.count == 3 {
+    struct Frame: Decodable {
+        let rows: [[ChatNodeSnapshot]]
+        let ids: [String]
+        let viewport: [String: Double]?
+        let visible: [Int]?
+        let bottomVerified: Bool?
+        let topVerified: Bool?
+        let fullyVisible: [Int]?
+        let tableID: String?
+        let windowID: String?
+        let conversationID: String?
+        let singleChatSelected: Bool?
+    }
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        guard let fixture = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawFrames = fixture["frames"] as? [[String: Any]], !rawFrames.isEmpty else {
+            throw RecoveryError(reason: "invalid_fixture")
+        }
+        let frames = try JSONDecoder().decode([Frame].self, from: JSONSerialization.data(withJSONObject: rawFrames))
+        let kind = fixture["kind"] as? String ?? "chat"
+        var reads = 0
+        var scrolls: [[String: Any]] = []
+        let read: () throws -> RecoverySnapshot = {
+                let frame = frames[min(reads, frames.count - 1)]
+                reads += 1
+                if kind == "inbox", frame.singleChatSelected == false { throw RecoveryError(reason: "single_chat_not_selected") }
+                guard frame.ids.count == frame.rows.count, frame.ids.count <= 4096,
+                      !frame.ids.isEmpty, frame.ids.allSatisfy({ !$0.isEmpty }), Set(frame.ids).count == frame.ids.count else {
+                    throw RecoveryError(reason: "ax_row_identity_unverified")
+                }
+                return RecoverySnapshot(scope: ["kind": kind, "table_id": frame.tableID ?? "fixture-table",
+                    "window_id": frame.windowID ?? "fixture-window", "conversation_id": kind == "chat" ? frame.conversationID ?? "fixture-conversation" : ""],
+                    conversation: ["id": frame.conversationID ?? "fixture-conversation", "title": "fixture"],
+                    ids: frame.ids, visible: frame.visible ?? Array(frame.ids.indices.prefix(20)),
+                    bottomVerified: frame.bottomVerified ?? false, payloads: { range in
+                        range.map { index in
+                            var payload = chatPayload(frame.rows[index], index: index + 1, viewport: frame.viewport)
+                            payload["captureRowId"] = frame.ids[index]
+                            payload["snapshotComplete"] = true
+                            return payload
+                        }
+                    }, topVerified: frame.topVerified ?? false, fullyVisible: frame.fullyVisible ?? frame.visible ?? Array(frame.ids.indices))
+        }
+        let move: (RecoverySnapshot, Int, String, Bool) -> String = { snapshot, index, direction, edge in
+            scrolls.append(["target_id": snapshot.ids[index], "direction": direction, "edge": edge])
+            return fixture["scrollMethod"] as? String ?? "AXScrollToVisible"
+        }
+        let size = min(20, fixture["size"] as? Int ?? 20)
+        let cursor = fixture["cursor"] as? [String: Any]
+        var result = fixture["operation"] as? String == "reveal"
+            ? recoveryReveal(row: fixture["row"] as? Int ?? 0, cursor: cursor, size: size, read: read, move: move)
+            : recoveryPage(kind: kind, action: fixture["action"] as? String ?? "latest",
+                           size: size, cursor: cursor, read: read, move: move)
+        if let imagePath = fixture["imagePath"] as? String,
+           let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
+           let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+           let rect = fixture["window"] as? [String: Double] {
+            result = recoveryChatDirections(result, read: read, verify: { rows, cursor, size in
+                do {
+                    let after = try recoveryCaptureRows(cursor: cursor, before: rows, snapshot: read(), size: size)
+                    return applyBubbleDirections(after, image: image, windowRect: cgRect(rect), windowID: 1)
+                } catch {
+                    return rows.map { row in
+                        var payload = row
+                        payload["directionEvidence"] = ["source": "screencapturekit", "side": "unknown",
+                            "status": "recovery_" + ((error as? RecoveryError)?.reason ?? "capture_validation_failed")]
+                        return payload
+                    }
+                }
+            })
+        }
+        result["fixture_scrolls"] = scrolls
+        result["fixture_reads"] = reads
+        jsonLine(result)
+        exit(0)
+    } catch { fputs("Invalid recovery fixture\n", stderr); exit(2) }
+}
 if command == "chat-fixture", args.count == 3 {
     struct Fixture: Decodable {
         let rows: [[ChatNodeSnapshot]]
@@ -1919,18 +2511,51 @@ if command == "input-fixture", args.count == 3 {
         exit(0)
     } catch { fputs("Invalid input fixture\n", stderr); exit(2) }
 }
-if command == "chat" {
+if command == "chat" || command.hasPrefix("recovery-") {
     NSApplication.shared.setActivationPolicy(.prohibited)
 }
 let bundleID = ProcessInfo.processInfo.environment["WECOM_GUI_BUNDLE_ID"] ?? "com.tencent.WeWorkMac"
 guard let root = appElement(bundleID: bundleID) else {
+    if command.hasPrefix("recovery-") {
+        jsonLine(["ok": false, "reason": "app_not_running"])
+        exit(0)
+    }
     fputs("app not running: \(bundleID)\n", stderr)
     exit(1)
 }
 
 let window = measured("main_window") { mainWindow(root) }
 
-if command == "rows" {
+if command == "recovery-chat-page" || command == "recovery-inbox-page" || command == "recovery-chat-reveal" {
+    let kind = command == "recovery-inbox-page" ? "inbox" : "chat"
+    let action = args.count > 2 ? args[2] : (kind == "chat" ? "latest" : "current")
+    var cursor: [String: Any]?
+    if args.count > 4, args[4] != "null" {
+        guard args[4].utf8.count <= 32768, let data = args[4].data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data), let object = decoded as? [String: Any] else {
+            jsonLine(["ok": false, "reason": "invalid_cursor"])
+            exit(0)
+        }
+        cursor = object
+    }
+    AXUIElementSetMessagingTimeout(root, 0.3)
+    let size = min(20, intArg(3, defaultValue: 20))
+    if command == "recovery-chat-reveal" {
+        jsonLine(recoveryReveal(row: intArg(2, defaultValue: 0), cursor: cursor, size: size,
+            read: { try recoverySnapshot(root: root, kind: "chat") }, move: recoveryMove,
+            settle: { Thread.sleep(forTimeInterval: 0.15) }))
+        exit(0)
+    }
+    var page = recoveryPage(kind: kind, action: action, size: size, cursor: cursor,
+        read: { try recoverySnapshot(root: root, kind: kind) }, move: recoveryMove,
+        settle: { Thread.sleep(forTimeInterval: 0.15) })
+    if kind == "chat" {
+        page = recoveryChatDirections(page, read: { try recoverySnapshot(root: root, kind: "chat") }, verify: { rows, cursor, size in
+            verifyBubbleDirections(rows, root: root, window: mainWindow(root), table: nil, selected: nil, last: size, cursor: cursor)
+        })
+    }
+    jsonLine(page)
+} else if command == "rows" {
     let rows = conversationRows(root: root, window: window)
     for (index, row) in rows.enumerated() {
         let payload = rowPayload(row, index: index + 1)

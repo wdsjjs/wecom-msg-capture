@@ -26,6 +26,7 @@ DEFAULT_TAG_MARKERS = ("@微信", "外部", "部门", "BOT")
 NAVIGATION_ROW_TITLES = {"单聊", "群聊", "@我", "未读", "内部聊天"}
 _AX_SCAN_DISABLED_UNTIL = 0.0
 _CAPTURE_DEADLINE = ContextVar("wecom_capture_deadline", default=None)
+_RECOVERY_INBOX_CURSOR = ContextVar("wecom_recovery_inbox_cursor", default=None)
 
 
 class CaptureDeadlineExceeded(TimeoutError):
@@ -1639,6 +1640,35 @@ def reveal_chat_row(row: int, *, last: int = 20) -> dict:
     return results[0] if results else {"ok": False, "error": "chat_reveal_failed"}
 
 
+def recovery_reveal_chat_row(row: int, cursor: dict, last: int = 20) -> dict:
+    """Reveal a row from the same recovery page that supplied cursor.
+
+    Pass message['row'] and page['cursor'] together. Native maps that saved
+    index to an anchored AX identity before scrolling, and returns its current
+    row index and refreshed cursor. Follow with recovery_chat_page('current',
+    last=last, cursor=result['cursor']) for fresh geometry and SCK evidence.
+    A snapshot_reader may keep the original cursor to reread the same sequence;
+    each subsequent reveal must pair its row with that reader result's cursor.
+    """
+    if isinstance(row, bool) or not isinstance(row, int) or row <= 0:
+        return {"ok": False, "gap": True, "reason": "invalid_chat_row", "cursor": None}
+    if cursor is None:
+        return {"ok": False, "gap": True, "reason": "cursor_required", "cursor": None}
+    result, _ = _recovery_ax_result("recovery-chat-reveal", str(row), last, cursor)
+    result.setdefault("ok", False)
+    result.setdefault("reason", str(result.get("error") or ("" if result["ok"] else "recovery_reveal_unavailable")))
+    result.setdefault("gap", not result["ok"])
+    result.setdefault("cursor", None)
+    result.setdefault("progress_token", "")
+    result.setdefault("changed", False)
+    if result["ok"] and (not isinstance(result["cursor"], dict) or not result.get("capture_row_id")
+                         or not isinstance(result.get("row"), int) or not result["progress_token"]):
+        result.update(ok=False, reason="invalid_recovery_reveal_result")
+    if not result["ok"]:
+        result.update(gap=True, cursor=None, progress_token="")
+    return result
+
+
 def _image_capture_dir() -> Path:
     configured = os.environ.get("WECOM_GUI_CAPTURE_IMAGE_DIR", "").strip()
     if configured:
@@ -1850,8 +1880,21 @@ def _ax_chat_messages(
     include_hidden_images: bool = False,
     include_hidden_image_media: bool = True,
 ) -> list[dict]:
-    messages: list[dict] = []
     snapshot_items = _swift_ax(["chat", str(last)])
+    return _chat_messages_from_ax_items(
+        snapshot_items, last, include_hidden_images=include_hidden_images,
+        include_hidden_image_media=include_hidden_image_media,
+    )
+
+
+def _chat_messages_from_ax_items(
+    snapshot_items: list[dict],
+    last: int,
+    *,
+    include_hidden_images: bool = False,
+    include_hidden_image_media: bool = True,
+) -> list[dict]:
+    messages: list[dict] = []
     viewport = next((item.get("chatViewport") for item in snapshot_items
                      if isinstance(item.get("chatViewport"), dict) and _float_value(item["chatViewport"].get("width")) > 0), None)
     geometry = {}
@@ -1989,6 +2032,128 @@ def _ax_chat_messages(
             "source": "screencapturekit", "status": "unsupported_media", "side": "unknown",
         })
     return messages[-last:] if last > 0 else messages
+
+
+def _recovery_ax_result(command: str, value: str, size: int, cursor: dict | None) -> tuple[dict, int]:
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("recovery page size must be a positive integer")
+    if cursor is not None and not isinstance(cursor, dict):
+        raise ValueError("cursor must be a dict or None")
+    size = min(size, 20)
+    encoded_cursor = json.dumps(cursor, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(encoded_cursor) > 32768:
+        raise ValueError("recovery cursor exceeds 32768 bytes")
+    items = _swift_ax([command, value, str(size), encoded_cursor])
+    result = dict(items[-1]) if items and isinstance(items[-1], dict) else {}
+    return result, size
+
+
+def _recovery_page(kind: str, action: str, size: int, cursor: dict | None) -> dict:
+    result, size = _recovery_ax_result(f"recovery-{kind}-page", action, size, cursor)
+    result.setdefault("ok", False)
+    result.setdefault("reason", str(result.get("error") or ("" if result["ok"] else "recovery_ax_unavailable")))
+    result.setdefault("cursor", None)
+    result.setdefault("progress_token", "")
+    result.setdefault("conversation", None)
+    result.setdefault("table_id", "")
+    result.setdefault("window_id", "")
+    result.setdefault("at_start", False)
+    result.setdefault("at_end", False)
+    result.setdefault("at_latest", False)
+    result.setdefault("gap", not result["ok"])
+    result.setdefault("moved", False)
+    result["action"] = action
+    result["limit" if kind == "inbox" else "last"] = size
+    rows = result.get("rows")
+    if result["ok"] and (not isinstance(rows, list) or len(rows) > size
+                         or not all(isinstance(row, dict) for row in rows)
+                         or not isinstance(result["cursor"], dict)
+                         or not result["progress_token"]):
+        result.update(ok=False, gap=True, reason="invalid_recovery_snapshot")
+    if not result["ok"]:
+        result.update(rows=[], at_start=False, at_end=False, at_latest=False, cursor=None, gap=True)
+    return result
+
+
+def recovery_prepare_inbox() -> dict:
+    """Select and verify single-chat once before a recovery inbox traversal.
+
+    Call under the GUI lock at the start of discovery and each locate pass,
+    then check ok before reading pages. This explicit preparation owns the
+    navigation change; recovery_inbox_page only reads/verifies the filter.
+    """
+    _RECOVERY_INBOX_CURSOR.set(None)
+    items = _swift_ax("ensure-single-chat")
+    result = dict(items[-1]) if items and isinstance(items[-1], dict) else {}
+    ok = result.get("ok") is True
+    result.update(ok=ok, gap=not ok)
+    result["reason"] = "" if ok else str(result.get("reason") or result.get("error") or "single_chat_prepare_unavailable")
+    return result
+
+
+def recovery_inbox_page(action: str = "current", limit: int = 20, *, cursor: dict | None = None) -> dict:
+    """Read at most 20 inbox rows; next overlaps by up to five rows.
+
+    A cursor is retained in this Python context for the two-argument API. Pass
+    the returned cursor explicitly to resume in another context/process. Top
+    resets it. at_end proves only the currently exposed AX list boundary.
+    Call recovery_prepare_inbox first. Native rechecks single-chat selection
+    without changing it; only verified pages use the bounded candidate source.
+    No activation, navigation selection, global wheel, or sending fallback.
+    """
+    if action not in {"current", "top", "next"}:
+        raise ValueError("action must be current, top, or next")
+    if cursor is None and action == "next":
+        cursor = _RECOVERY_INBOX_CURSOR.get()
+    result = _recovery_page("inbox", action, limit, None if action == "top" else cursor)
+    rows = result.pop("rows", [])
+    source = "axuielement-bounded" if result.get("single_chat_verified") is True else "axuielement-recovery-inbox"
+    conversations = []
+    for item in rows:
+        row = _row_from_ax_item(item, index=int(item.get("index") or len(conversations) + 1),
+                                source=source)
+        if row is not None and row["title"] not in NAVIGATION_ROW_TITLES:
+            row["capture_row_id"] = str(item.get("captureRowId") or "")
+            row["table_id"] = result["table_id"]
+            conversations.append(row)
+    result["conversations"] = conversations
+    _RECOVERY_INBOX_CURSOR.set(result["cursor"] if result["ok"] else None)
+    return result
+
+
+def recovery_chat_page(
+    action: str = "latest", last: int = 20, cursor: dict | None = None,
+) -> dict:
+    """Read a bounded raw chat page, in chronological AX row order.
+
+    older/newer/current require the returned cursor (JSON serializable). It
+    anchors the entire page to its conversation, table and row sequence;
+    current never scrolls and rereads that exact sequence, even after prepend.
+    Messages use chat_messages' raw format with role=unknown, image media and
+    SCK direction_evidence. No attachment capture or infer_roles is performed.
+    Pair each message's row with this response's cursor when revealing it;
+    row_offset may change after prepend while progress_token stays stable.
+    at_start remains false unless history is
+    proven; a loaded AX edge alone yields history_boundary_unverified.
+    """
+    if action not in {"latest", "older", "newer", "current"}:
+        raise ValueError("action must be latest, older, newer, or current")
+    result = _recovery_page("chat", action, last, cursor)
+    rows = result.pop("rows", [])
+    if result["ok"] and any(not item.get("snapshotComplete")
+                            or not isinstance(item.get("chatViewport"), dict)
+                            or _float_value(item["chatViewport"].get("width")) <= 0 for item in rows):
+        result.update(ok=False, gap=True, reason="invalid_recovery_snapshot", cursor=None,
+                      at_start=False, at_end=False, at_latest=False)
+        rows = []
+    # Never let the raw parser fall back to geometry/chat-all for an empty page.
+    result["messages"] = _chat_messages_from_ax_items(
+        rows, result["last"], include_hidden_images=True, include_hidden_image_media=True,
+    ) if rows else []
+    result["message_count"] = len(result["messages"])
+    result["source"] = "accessibility-chat-table"
+    result["capture_images"] = False
+    return result
 
 
 def chat_messages(

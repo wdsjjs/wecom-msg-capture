@@ -8,6 +8,8 @@ from cli_anything.wecom_gui.core import edge_channel, runtime_state
 
 
 def publish(process: str, **kwargs) -> dict:
+    if process == 'edge_channel':
+        kwargs['metrics'] = {**(kwargs.get('metrics') or {}), 'history_recovery_v1': True}
     local = runtime_state.report(process, **kwargs)
 
     def project() -> None:

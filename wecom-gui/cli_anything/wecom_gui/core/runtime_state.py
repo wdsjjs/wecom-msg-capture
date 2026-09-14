@@ -198,7 +198,8 @@ def snapshot(*, limit: int = MAX_EVENTS) -> dict[str, Any]:
             "SELECT * FROM runtime_activity_event WHERE expires_at > ? ORDER BY occurred_at DESC LIMIT ?",
             (now, max(1, min(MAX_EVENTS, int(limit)))),
         ).fetchall()]
-    return {"ok": True, "now": now, "states": states, "events": events}
+    from cli_anything.wecom_gui.core import recovery_state
+    return {"ok": True, "now": now, "states": states, "events": events, 'recovery': recovery_state.snapshot()}
 
 
 def record_supervisor(

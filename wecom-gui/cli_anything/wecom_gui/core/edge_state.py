@@ -9,6 +9,7 @@ network/process failures.
 from __future__ import annotations
 
 import json
+import fcntl
 import sqlite3
 import time
 import uuid
@@ -29,10 +30,16 @@ RESULT_REPORTED = "result_reported"
 def _connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(state.db_path())
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    _ensure_schema(conn)
     try:
+        # Multiple control/status processes can initialize a fresh local DB
+        # together. Serialize schema inspection and additions as one unit.
+        with (state.state_dir() / 'edge-schema.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute('BEGIN IMMEDIATE')
+            _ensure_schema(conn)
+            conn.commit()
         yield conn
         conn.commit()
     finally:
