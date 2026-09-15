@@ -102,7 +102,7 @@ def _locate(row, *, checkpoint=lambda: None):
         checkpoint()
         page = macos_backend.recovery_inbox_page(action=action, limit=WINDOW)
         if not page.get('ok'):
-            raise RecoveryGap('conversation_list_unavailable')
+            raise RecoveryGap(page.get('reason') or 'conversation_list_unavailable')
         for item in page.get('conversations', []):
             if item.get('title') == row.get('title'):
                 identity = item.get('capture_row_id')
@@ -265,7 +265,7 @@ def _capture_page(job, row, uid, key, saved):
 def _recover_chat(job, task):
     from cli_anything.wecom_gui.core import edge_worker
     row = task['row']
-    _publish(job, 'reading', label=row.get('title', ''))
+    _publish(job, 'locating', label=row.get('title', ''))
     recovery_state.clear_pages(job, task)
     recovery_state.update_chat(job, task, status='reading', pages=0)
     with state.gui_lock():
@@ -273,6 +273,7 @@ def _recover_chat(job, task):
         selected = _locate(row, checkpoint=lambda: _checkpoint(job))
         if not edge_worker._wait_for_opened_conversation(selected):
             raise RecoveryGap('conversation_open_unconfirmed')
+        _publish(job, 'reading', label=row.get('title', ''))
         uid, error = edge_worker._current_identity_for_row(selected)
         if error or not uid:
             raise RecoveryGap(error or 'conversation_identity_missing')

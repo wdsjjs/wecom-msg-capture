@@ -87,6 +87,39 @@ private struct ControlReply: Decodable {
     }
 }
 
+private struct RecoveryChatPreview: Decodable {
+    let title: String
+    let status: String
+    let error_code: String
+    let pages: Int
+    var summary: String {
+        let state = ["pending": "等待定位", "reading": "读取中", "completed": "核对完成", "gap": "未完成"][status] ?? "待确认"
+        return "\(title) · \(state) · 已读取 \(pages) 页" + (error_code.isEmpty ? "" : " · \(recoveryErrorLabel(error_code))")
+    }
+}
+
+private struct RecoveryMessagePreview: Decodable {
+    let title: String
+    let text: String
+    let direction: String
+    let observed_at: String
+    let status: String
+    let registered: Bool
+    var summary: String {
+        let state = status == "delivered" ? "已上传" : registered ? "已登记，附件待完成" : "待登记"
+        let speaker = ["inbound": "客户", "outbound": "客服", "unknown": "方向待确认"][direction] ?? "方向待确认"
+        return "[\(state)] \(title) · \(speaker)：\(text)"
+    }
+}
+
+private func recoveryErrorLabel(_ code: String) -> String {
+    return ["conversation_list_unavailable": "无法读取企微会话列表", "conversation_not_found": "未找到对应会话",
+            "single_chat_not_selected": "未能确认企微单聊列表已选中", "single_chat_row_not_found": "未找到企微单聊入口",
+            "conversation_open_unconfirmed": "会话未成功打开", "history_anchor_missing": "历史消息尚未对齐",
+            "single_chat_prepare_unavailable": "无法切换到单聊列表", "inbox_page_unavailable": "会话列表读取失败",
+            "accessibility_denied": "缺少无障碍权限", "window_not_on_screen": "企微窗口不在屏幕中"][code] ?? code
+}
+
 private struct RuntimeRecovery: Decodable {
     var id = ""
     var status = "idle"
@@ -103,9 +136,13 @@ private struct RuntimeRecovery: Decodable {
     var updated_at: Double = 0
     var desired_mode: String?
     var hold_normal_operation: Bool?
+    var recent_chats: [RecoveryChatPreview] = []
+    var recent_messages: [RecoveryMessagePreview] = []
+    var discovery_error = ""
 
     private enum CodingKeys: String, CodingKey {
         case id, status, phase, conversation_label, discovered, completed, registered
+        case recent_chats, recent_messages, discovery_error
         case pending_uploads, pending_media, pending_direction, gaps, error_code, updated_at, desired_mode, hold_normal_operation
     }
 
@@ -128,6 +165,9 @@ private struct RuntimeRecovery: Decodable {
         updated_at = try values.decodeIfPresent(Double.self, forKey: .updated_at) ?? 0
         desired_mode = try values.decodeIfPresent(String.self, forKey: .desired_mode)
         hold_normal_operation = try values.decodeIfPresent(Bool.self, forKey: .hold_normal_operation)
+        recent_chats = Array((try values.decodeIfPresent([RecoveryChatPreview].self, forKey: .recent_chats) ?? []).prefix(20))
+        recent_messages = Array((try values.decodeIfPresent([RecoveryMessagePreview].self, forKey: .recent_messages) ?? []).prefix(20))
+        discovery_error = try values.decodeIfPresent(String.self, forKey: .discovery_error) ?? ""
     }
 
     var isActive: Bool { ["requested", "running"].contains(status) }
@@ -143,7 +183,7 @@ private struct RuntimeRecovery: Decodable {
 
 private func recoveryPhaseLabel(_ phase: String) -> String {
     let name = phase.hasPrefix("recovery_") ? String(phase.dropFirst("recovery_".count)) : phase
-    return ["preflight": "补录准备", "discovering": "发现会话", "reading": "读取聊天记录", "capturing": "核对消息与图片", "gap": "历史存在缺口",
+    return ["preflight": "补录准备", "discovering": "发现会话", "locating": "正在定位会话", "reading": "读取聊天记录", "capturing": "核对消息与图片", "gap": "历史存在缺口",
      "uploading": "上传补录记录", "network_retry": "等待网络重试", "paused": "已暂停", "completed": "补录完成",
      "partial": "部分完成", "resuming": "正在恢复正常收发", "resumed": "已恢复正常收发"][name] ?? phase
 }
@@ -190,10 +230,17 @@ private struct RuntimeSnapshot: Decodable {
 
     var recoveryDetails: String {
         guard let recovery else { return "聊天记录补录: 尚未补录" }
-        return "聊天记录补录: \(recovery.statusLabel)\n阶段: \(recoveryPhaseLabel(recovery.phase)) (\(recovery.phase))\n会话: \(recovery.conversation_label)\n"
+        var detail = "聊天记录补录: \(recovery.statusLabel)\n阶段: \(recoveryPhaseLabel(recovery.phase)) (\(recovery.phase))\n会话: \(recovery.conversation_label)\n"
             + recovery.countsText + "\n错误码: \(recovery.error_code.isEmpty ? "无" : recovery.error_code)"
             + "\n更新时间: \(recovery.updated_at)\n运行模式: \(desiredMode ?? "未提供")\n正常自动收发: \(holdsNormalOperation ? "未恢复" : "已放行")"
             + (recoveryIssue.map { "\n处理提示: \($0)" } ?? "")
+        detail += "\n\n最近会话（最多 20 个）\n"
+        detail += recovery.recent_chats.isEmpty ? "尚未读取会话" : recovery.recent_chats.map(\.summary).joined(separator: "\n")
+        detail += "\n\n最近核对消息（最多 20 条；时间为首次观测时间）\n"
+        let messages = recovery.recent_messages.map { $0.summary + "\n首次观测：" + $0.observed_at }
+        detail += messages.isEmpty ? "本次尚无补录消息" : messages.joined(separator: "\n\n")
+        if !recovery.discovery_error.isEmpty { detail += "\n列表发现失败：" + recoveryErrorLabel(recovery.discovery_error) }
+        return detail
     }
 
     var recoveryIssue: String? {
@@ -256,7 +303,7 @@ private final class FloatingDashboardView: NSView {
     func update(_ value: RuntimeSnapshot) {
         if value.recovery?.isActive == true && snapshot.recovery?.isActive != true { expanded = true }
         snapshot = value
-        let height: CGFloat = expanded ? 680 : 560
+        let height: CGFloat = expanded ? 740 : 560
         if frame.height != height {
             if let window {
                 var rect = window.frame
@@ -390,6 +437,14 @@ private final class FloatingDashboardView: NSView {
                            ("待补图", recovery.pending_media), ("待确认", recovery.pending_direction)]
                 .filter { $0.1 > 0 }.map { "\($0.0) \($0.1)" }.joined(separator: " · ")
             text(pending.isEmpty ? "暂无待处理项" : pending, 24, top - 514, 372, size: 12, color: .secondaryLabelColor)
+            let latestChat = recovery.conversation_label.isEmpty ? recovery.recent_chats.first?.summary : nil
+            text(latestChat ?? "最近核对消息", 24, top - 544, 372, size: 12, color: .secondaryLabelColor)
+            for index in 0..<2 {
+                let preview = recovery.recent_messages.indices.contains(index) ? recovery.recent_messages[index].summary
+                    : index == 0 ? "本次尚无补录消息" : ""
+                text(preview, 24, top - 572 - CGFloat(index) * 26, 372, size: 12)
+            }
+            button("details", "补录明细", "list.bullet", NSRect(x: 280, y: 105, width: 116, height: 28))
         }
         divider(100)
         button("workbench", "中台", "arrow.up.right.square", NSRect(x: 24, y: 48, width: 112, height: 32))
@@ -404,7 +459,7 @@ private final class FloatingDashboardView: NSView {
         case "workbench": onWorkbench?()
         case "expand":
             expanded.toggle()
-            let height: CGFloat = expanded ? 680 : 560
+            let height: CGFloat = expanded ? 740 : 560
             if let window {
                 var frame = window.frame
                 let outerHeight = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 420, height: height)).height
@@ -463,6 +518,7 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     private var snapshot = RuntimeSnapshot(states: [], events: [])
     private let control: String
     private var detailWindow: NSWindow?
+    private var detailTextView: NSTextView?
     private var floatingPanel: FloatingStatusPanel?
     private var dashboard: FloatingDashboardView?
     private var timer: Timer?
@@ -671,6 +727,9 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
         dashboard?.actionInFlight = actionInFlight
         let issue = access.issue ?? (refreshError.isEmpty ? nil : refreshError) ?? snapshot.recoveryIssue
         dashboard?.controlNotice = issue ?? actionNotice
+        if detailWindow?.isVisible == true, detailTextView?.string != detailsText {
+            detailTextView?.string = detailsText
+        }
         if let issue {
             item?.button?.image = indicator(.systemRed)
             summary.title = "本机状态: \(issue)"
@@ -815,12 +874,18 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showDetails() {
+        if let detailWindow, detailWindow.isVisible {
+            detailTextView?.string = detailsText
+            detailWindow.makeKeyAndOrderFront(nil)
+            return
+        }
         let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 760, height: 520)); text.isEditable = false
+        detailTextView = text
         text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         text.string = detailsText
         let scroll = NSScrollView(frame: text.bounds); scroll.documentView = text; scroll.hasVerticalScroller = true; scroll.autoresizingMask = [.width, .height]
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = "UDA WeCom Agent - 本机流转轨迹"; window.contentView = scroll; detailWindow = window; window.makeKeyAndOrderFront(nil)
+        window.title = "企微客服助手 - 补录明细与运行记录"; window.contentView = scroll; detailWindow = window; window.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -844,6 +909,11 @@ private func testSnapshotJSON(status: String? = nil, mode: String? = nil, phase:
             "body": "PRIVATE_CUSTOMER_BODY", "token": "PRIVATE_TEST_KEY"]
         recovery["desired_mode"] = mode
         recovery["hold_normal_operation"] = hold
+        recovery["recent_chats"] = [["title": name, "status": "reading", "pages": 3, "error_code": ""]]
+        recovery["recent_messages"] = [
+            ["title": name, "text": "这是用于验收的合成消息", "direction": "inbound", "observed_at": "测试观测时间", "status": "delivered", "registered": true],
+            ["title": name, "text": "[图片]", "direction": "unknown", "observed_at": "测试观测时间", "status": "waiting_media", "registered": true],
+        ]
         fixture["recovery"] = recovery
     }
     return String(data: try! JSONSerialization.data(withJSONObject: fixture), encoding: .utf8)!

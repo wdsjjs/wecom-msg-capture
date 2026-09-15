@@ -46,6 +46,15 @@ read in windows of at most 20 AX rows with overlapping pages. Recovery walks
 backward until it can join the persisted ordered ledger, then registers messages
 chronologically. Native cursors are revalidated against conversation/table/row
 identity. A resumed visit discards native cursors and uses persisted message IDs.
+Single-chat navigation recognition accepts up to 20 rows, including blank spacer
+rows and additional filters. It still requires exactly one single-chat entry and
+its actual AX selected state; an ambiguous or unselected entry blocks discovery.
+Boundary checks support WeCom's normalized scrollbar values when optional range
+and row-count attributes are absent. A disabled scrollbar only confirms the
+exposed list boundary when all loaded rows fit inside the viewport. Lazy history
+loads get at most two additional targeted scrolls to reveal the relocated page,
+with cursor and conversation identity checked again after every move. These
+checks confirm the visible list/latest edge, never the beginning of all history.
 Pictures use the same-page identity and pixel checks before and after capture.
 Older pending images and uncertain directions determine how far recovery goes
 back, even beyond the ordinary 200-entry matching window. Clicking recovery again
@@ -213,6 +222,13 @@ connection status does not claim that AI reception is enabled. Recovery details
 expand while recovery runs and can be collapsed independently. The reception button
 pauses an active worker or explicitly resumes normal operation after recovery.
 Logs and internal phase/error codes remain available through details and the menu.
+Recovery details show the current locating/reading phase, the latest 20 conversation
+outcomes and the latest 20 linked message previews (each capped at 160 characters).
+These previews are local UI data only, excluded from recovery worker results and
+central telemetry. A linked message means it was checked in this recovery, not
+necessarily newly created; registration and attachment delivery are shown separately.
+The details window refreshes with local status. Observation timestamps are not
+claimed as original send times. Zero registered messages is not successful backfill.
 
 Install the AppKit menu-bar client to `~/Applications`:
 

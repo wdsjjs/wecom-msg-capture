@@ -206,7 +206,7 @@ def confirm_boundary(conversation_key: str) -> None:
         conn.execute('DELETE FROM edge_history_recovery_boundary WHERE conversation_key=?', (conversation_key,))
 
 
-def snapshot() -> dict:
+def snapshot(*, include_details: bool = False) -> dict:
     with transaction() as conn:
         row = conn.execute('SELECT * FROM edge_history_recovery WHERE singleton=1').fetchone()
         if not row:
@@ -224,7 +224,30 @@ def snapshot() -> dict:
             WHERE (json_extract(payload_json,'$.message.source.recovery_id')=?
                 OR client_event_id IN (SELECT event_id FROM edge_history_recovery_message WHERE recovery_id=?))
             AND json_extract(payload_json,'$.message.direction')='unknown'""", (job['id'], job['id'])).fetchone()[0]
-        return {k: job[k] for k in ('id','desired_mode','status','phase','conversation_label','error_code','updated_at')} | {
+        details = {}
+        if include_details:
+            # Local UI only. Never include message previews in telemetry or worker logs.
+            tasks = conn.execute("""SELECT row_json,status,error_code,pages FROM edge_history_recovery_chat
+                WHERE recovery_id=? ORDER BY updated_at DESC, rowid DESC LIMIT 20""", (job['id'],)).fetchall()
+            messages = conn.execute("""SELECT payload_json,status,registered_direction FROM edge_inbound_events
+                WHERE json_extract(payload_json,'$.message.source.recovery_id')=?
+                OR client_event_id IN (SELECT event_id FROM edge_history_recovery_message WHERE recovery_id=?)
+                ORDER BY id DESC LIMIT 20""", (job['id'], job['id'])).fetchall()
+            details['recent_chats'] = [{'title': str(json.loads(r['row_json']).get('title') or '')[:128],
+                'status': r['status'], 'error_code': r['error_code'], 'pages': r['pages']} for r in tasks]
+            details['recent_messages'] = []
+            for row in messages:
+                event = json.loads(row['payload_json'])
+                message = event.get('message') or {}
+                details['recent_messages'].append({
+                    'title': str((event.get('conversation') or {}).get('title') or '')[:128],
+                    'text': str(message.get('text') or ('[图片]' if message.get('media') else ''))[:160],
+                    'direction': message.get('direction') or 'unknown',
+                    'observed_at': str(event.get('occurred_at') or ''),
+                    'status': row['status'], 'registered': bool(row['registered_direction']) or row['status'] == 'delivered',
+                })
+            details['discovery_error'] = job['discovery_error']
+        return {k: job[k] for k in ('id','desired_mode','status','phase','conversation_label','error_code','updated_at')} | details | {
             'hold_normal_operation': job['desired_mode'] != 'normal' or bool(job['release_pending']),
             'discovered': sum(counts.values()), 'completed': counts.get('completed', 0),
             'gaps': counts.get('gap', 0) + int(bool(job['discovery_error'])), 'registered': stats['registered'],

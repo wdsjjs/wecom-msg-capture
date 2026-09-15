@@ -322,6 +322,14 @@ func singleChatRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
     }
 }
 
+func recoverySingleChatIndices(_ texts: [[String]]) -> [Int] {
+    // Navigation includes blank spacer rows and can exceed eight entries.
+    guard texts.count <= 20 else { return [] }
+    let labels = texts.flatMap { $0 }
+    guard labels.contains(where: { ["群聊", "@我", "未读", "内部聊天"].contains($0) }) else { return [] }
+    return texts.indices.filter { texts[$0].contains("单聊") }
+}
+
 func singleChatPreparationResult(selectedBefore: Bool, rowAfter: [String: Any]?) -> [String: Any] {
     let identified = (rowAfter?["texts"] as? [String] ?? []).contains("单聊")
     let selectedAfter = identified && rowAfter?["selected"] as? Bool == true
@@ -2066,13 +2074,29 @@ func recoveryPage(kind: String, action: String, size: Int, cursor: [String: Any]
                           backwards ? "up" : "down", edge)
             settle()
         }
-        let after = try read()
+        var after = try read()
         result["observed_scope"] = after.scope
         result["observed_conversation"] = after.conversation
         try recoveryCheckScope(before.scope, after.scope)
         let relocated = try activeCursor.map { try recoveryResolve($0, in: after, size: size) }
-        let range = recoveryRange(action: action, count: after.ids.count, size: size, previous: relocated, visible: after.visible)
+        var range = recoveryRange(action: action, count: after.ids.count, size: size, previous: relocated, visible: after.visible)
         guard !range.isEmpty else { throw RecoveryError(reason: "rows_unavailable") }
+        // A lazy prepend can move the requested page above the row just revealed.
+        for _ in 0..<(action == "current" ? 0 : 2) {
+            let target = backwards ? range.lowerBound : range.upperBound - 1
+            let atBoundary = backwards ? range.lowerBound == 0 && after.topVerified
+                : range.upperBound == after.ids.count && after.bottomVerified
+            if after.visible.contains(target) || atBoundary { break }
+            method = move(after, target, backwards ? "up" : "down", false)
+            settle()
+            after = try read()
+            result["observed_scope"] = after.scope
+            result["observed_conversation"] = after.conversation
+            try recoveryCheckScope(before.scope, after.scope)
+            let previous = try activeCursor.map { try recoveryResolve($0, in: after, size: size) }
+            range = recoveryRange(action: action, count: after.ids.count, size: size, previous: previous, visible: after.visible)
+            guard !range.isEmpty else { throw RecoveryError(reason: "rows_unavailable") }
+        }
         let payloads = after.payloads(range)
         let nextCursor = recoveryCursor(after, range: range, size: size, payloads: payloads)
         // A second observation detects asynchronous loading, selection changes and AX row recycling.
@@ -2089,7 +2113,8 @@ func recoveryPage(kind: String, action: String, size: Int, cursor: [String: Any]
         let atTop = verifiedRange.lowerBound == 0 && verified.topVerified && stableInventory
         var reason = ""
         if method == "targeted_scroll_unavailable" { reason = method }
-        if action != "current", !verified.visible.contains(backwards ? verifiedRange.lowerBound : verifiedRange.upperBound - 1) {
+        if action != "current", !verified.visible.contains(backwards ? verifiedRange.lowerBound : verifiedRange.upperBound - 1),
+           !(backwards ? atTop : atBottom) {
             reason = "target_row_not_visible"
         }
         if kind == "chat", verifiedRange.lowerBound == 0 { reason = "history_boundary_unverified" }
@@ -2141,6 +2166,54 @@ func recoveryNumber(_ element: AXUIElement, _ attribute: CFString) -> Double? {
     return number.doubleValue
 }
 
+struct RecoveryScrollbarState: Decodable {
+    let value: Double?
+    let minimum: Double?
+    let maximum: Double?
+    let enabled: Bool?
+
+    var range: ClosedRange<Double>? {
+        guard let value = value, value.isFinite else { return nil }
+        if minimum == nil && maximum == nil {
+            // WeCom exposes normalized AXScrollBar values without min/max attributes.
+            return (0...1).contains(value) ? 0...1 : nil
+        }
+        guard let minimum = minimum, let maximum = maximum,
+              minimum.isFinite, maximum.isFinite, maximum > minimum,
+              (minimum...maximum).contains(value) else { return nil }
+        return minimum...maximum
+    }
+}
+
+func recoveryScrollbarState(_ bar: AXUIElement) -> RecoveryScrollbarState? {
+    guard role(bar) == "AXScrollBar" else { return nil }
+    return RecoveryScrollbarState(value: recoveryNumber(bar, kAXValueAttribute as CFString),
+        minimum: recoveryNumber(bar, kAXMinValueAttribute as CFString),
+        maximum: recoveryNumber(bar, kAXMaxValueAttribute as CFString),
+        enabled: recoveryNumber(bar, kAXEnabledAttribute as CFString).map { $0 == 1 })
+}
+
+func recoveryBoundaries(viewport: CGRect, rowRects: [CGRect?], reportedCount: Double?,
+                        scrollbar: RecoveryScrollbarState?) -> (top: Bool, bottom: Bool) {
+    guard viewport.width > 0, viewport.height > 0, !rowRects.isEmpty,
+          reportedCount == nil || reportedCount == Double(rowRects.count),
+          let scrollbar = scrollbar else { return (false, false) }
+    func contained(_ rect: CGRect?) -> Bool {
+        guard let rect = rect, rect.width > 0, rect.height >= 0 else { return false }
+        // The inbox can start with a zero-height spacer row.
+        return rect.minX >= viewport.minX && rect.maxX <= viewport.maxX
+            && rect.minY >= viewport.minY && rect.maxY <= viewport.maxY
+    }
+    if scrollbar.enabled == false {
+        let fits = rowRects.allSatisfy(contained) && rowRects.contains { ($0?.height ?? 0) > 0 }
+        return (fits, fits)
+    }
+    guard let range = scrollbar.range, let value = scrollbar.value else { return (false, false) }
+    let tolerance = (range.upperBound - range.lowerBound) * 0.000001
+    return (abs(value - range.lowerBound) <= tolerance && contained(rowRects[0]),
+            abs(value - range.upperBound) <= tolerance && contained(rowRects[rowRects.count - 1]))
+}
+
 func recoveryScrollbar(_ area: AXUIElement) -> AXUIElement? {
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(area, kAXVerticalScrollBarAttribute as CFString, &value) == .success,
@@ -2173,11 +2246,9 @@ func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapsho
             guard let rect = rectPayload(table), rect["x", default: 0] < listRight else { continue }
             let rows = try recoveryRows(table)
             // Limit navigation label inspection to small tables.
-            guard rows.count <= 8 else { continue }
+            guard rows.count <= 20 else { continue }
             let texts = rows.map { collectText($0, maxDepth: 4) }
-            let labels = texts.flatMap { $0 }
-            guard labels.contains("单聊"), labels.contains(where: { ["群聊", "@我", "未读", "内部聊天"].contains($0) }) else { continue }
-            singleRows += rows.indices.filter { texts[$0].contains("单聊") }.map { rows[$0] }
+            singleRows += recoverySingleChatIndices(texts).map { rows[$0] }
         }
         guard singleRows.count == 1, recoveryNumber(singleRows[0], kAXSelectedAttribute as CFString) == 1 else {
             throw RecoveryError(reason: "single_chat_not_selected")
@@ -2232,19 +2303,13 @@ func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapsho
         let bounds = cgRect(rect)
         return bounds.width > 0 && bounds.height > 0 && cgRect(viewport).intersects(bounds)
     }
-    var bottom = false
-    var top = false
-    if let bar = recoveryScrollbar(area), let value = recoveryNumber(bar, kAXValueAttribute as CFString),
-       let minimum = recoveryNumber(bar, kAXMinValueAttribute as CFString),
-       let maximum = recoveryNumber(bar, kAXMaxValueAttribute as CFString), maximum > minimum,
-       let last = rows.last.flatMap({ rectPayload($0) }), let first = rows.first.flatMap({ rectPayload($0) }),
-       recoveryNumber(table, kAXRowCountAttribute as CFString) == Double(rows.count) {
-        bottom = abs(value - maximum) <= (maximum - minimum) * 0.000001 && cgRect(viewport).contains(cgRect(last))
-        top = abs(value - minimum) <= (maximum - minimum) * 0.000001 && cgRect(viewport).contains(cgRect(first))
-    }
+    let boundary = recoveryBoundaries(viewport: cgRect(viewport),
+        rowRects: rows.map { rectPayload($0).map(cgRect) },
+        reportedCount: recoveryNumber(table, kAXRowCountAttribute as CFString),
+        scrollbar: recoveryScrollbar(area).flatMap(recoveryScrollbarState))
     return RecoverySnapshot(scope: ["kind": kind, "table_id": tableID, "window_id": windowID,
         "conversation_id": kind == "chat" ? conversation["id"] as? String ?? "" : ""],
-        conversation: conversation, ids: ids, visible: visible, bottomVerified: bottom, payloads: { range in
+        conversation: conversation, ids: ids, visible: visible, bottomVerified: boundary.bottom, payloads: { range in
             range.map { index in
                 var payload = kind == "chat" ? chatPayload(rows[index], index: index + 1, viewport: viewport)
                     : recentRowPayload(rows[index], index: index + 1, minutes: 0)
@@ -2252,7 +2317,7 @@ func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapsho
                 payload["snapshotComplete"] = true
                 return payload
             }
-        }, topVerified: top, fullyVisible: rows.indices.filter { index in
+        }, topVerified: boundary.top, fullyVisible: rows.indices.filter { index in
             guard let rect = rectPayload(rows[index]) else { return false }
             return cgRect(rect).height > 0 && cgRect(viewport).insetBy(dx: 0, dy: 4).contains(cgRect(rect))
         }, table: table, scrollArea: area, rows: rows)
@@ -2314,14 +2379,18 @@ func recoveryMove(_ snapshot: RecoverySnapshot, index: Int, direction: String, e
     guard let table = snapshot.table, let area = snapshot.scrollArea, snapshot.rows.indices.contains(index) else {
         return "targeted_scroll_unavailable"
     }
+    if edge, direction == "down", snapshot.bottomVerified { return "already_at_boundary" }
+    if edge, direction == "up", snapshot.scope["kind"] == "inbox", snapshot.topVerified {
+        return "already_at_boundary"
+    }
     let row = snapshot.rows[index]
     if !edge {
         if snapshot.fullyVisible.contains(index) { return "already_visible" }
         if AXUIElementPerformAction(row, "AXScrollToVisible" as CFString) == .success { return "AXScrollToVisible" }
     }
-    if let bar = recoveryScrollbar(area), let minimum = recoveryNumber(bar, kAXMinValueAttribute as CFString),
-       let maximum = recoveryNumber(bar, kAXMaxValueAttribute as CFString), maximum > minimum,
-       let current = recoveryNumber(bar, kAXValueAttribute as CFString) {
+    if let bar = recoveryScrollbar(area), let state = recoveryScrollbarState(bar),
+       let range = state.range, let current = state.value, state.enabled != false {
+        let minimum = range.lowerBound, maximum = range.upperBound
         var target = direction == "up" ? minimum : maximum
         if !edge {
             guard let viewport = rectPayload(area), let rect = rectPayload(row),
@@ -2337,12 +2406,15 @@ func recoveryMove(_ snapshot: RecoverySnapshot, index: Int, direction: String, e
             return "AXScrollBar"
         }
     }
-    let action = direction == "up" ? "AXScrollUp" : "AXScrollDown"
     for target in [area, table] {
         var actions: CFArray?
-        if AXUIElementCopyActionNames(target, &actions) == .success,
-           (actions as? [String] ?? []).contains(action),
-           AXUIElementPerformAction(target, action as CFString) == .success { return action }
+        if AXUIElementCopyActionNames(target, &actions) == .success {
+            let available = actions as? [String] ?? []
+            let candidates = direction == "up" ? ["AXScrollUp", "AXScrollUpByPage"] : ["AXScrollDown", "AXScrollDownByPage"]
+            for action in candidates where available.contains(action) {
+                if AXUIElementPerformAction(target, action as CFString) == .success { return action }
+            }
+        }
     }
     // Even at scrollbar minimum, revealing the first row may request a lazy history load.
     if edge, AXUIElementPerformAction(row, "AXScrollToVisible" as CFString) == .success { return "AXScrollToVisible" }
@@ -2363,6 +2435,10 @@ if command == "single-chat-fixture", args.count == 3 {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
         guard let cases = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { exit(2) }
         for item in cases {
+            if let texts = item["navigationTexts"] as? [[String]] {
+                jsonLine(["indices": recoverySingleChatIndices(texts)])
+                continue
+            }
             jsonLine(singleChatPreparationResult(selectedBefore: item["selectedBefore"] as? Bool ?? false,
                                                  rowAfter: item["rowAfter"] as? [String: Any]))
         }
@@ -2382,6 +2458,8 @@ if command == "recovery-fixture", args.count == 3 {
         let windowID: String?
         let conversationID: String?
         let singleChatSelected: Bool?
+        let scrollbar: RecoveryScrollbarState?
+        let reportedCount: Double?
     }
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
@@ -2401,18 +2479,21 @@ if command == "recovery-fixture", args.count == 3 {
                       !frame.ids.isEmpty, frame.ids.allSatisfy({ !$0.isEmpty }), Set(frame.ids).count == frame.ids.count else {
                     throw RecoveryError(reason: "ax_row_identity_unverified")
                 }
+                let boundary = recoveryBoundaries(viewport: cgRect(frame.viewport ?? [:]),
+                    rowRects: frame.rows.map { $0.first.flatMap { $0.hasRect ? cgRect($0.rect) : nil } },
+                    reportedCount: frame.reportedCount, scrollbar: frame.scrollbar)
                 return RecoverySnapshot(scope: ["kind": kind, "table_id": frame.tableID ?? "fixture-table",
                     "window_id": frame.windowID ?? "fixture-window", "conversation_id": kind == "chat" ? frame.conversationID ?? "fixture-conversation" : ""],
                     conversation: ["id": frame.conversationID ?? "fixture-conversation", "title": "fixture"],
                     ids: frame.ids, visible: frame.visible ?? Array(frame.ids.indices.prefix(20)),
-                    bottomVerified: frame.bottomVerified ?? false, payloads: { range in
+                    bottomVerified: frame.bottomVerified ?? boundary.bottom, payloads: { range in
                         range.map { index in
                             var payload = chatPayload(frame.rows[index], index: index + 1, viewport: frame.viewport)
                             payload["captureRowId"] = frame.ids[index]
                             payload["snapshotComplete"] = true
                             return payload
                         }
-                    }, topVerified: frame.topVerified ?? false, fullyVisible: frame.fullyVisible ?? frame.visible ?? Array(frame.ids.indices))
+                    }, topVerified: frame.topVerified ?? boundary.top, fullyVisible: frame.fullyVisible ?? frame.visible ?? Array(frame.ids.indices))
         }
         let move: (RecoverySnapshot, Int, String, Bool) -> String = { snapshot, index, direction, edge in
             scrolls.append(["target_id": snapshot.ids[index], "direction": direction, "edge": edge])

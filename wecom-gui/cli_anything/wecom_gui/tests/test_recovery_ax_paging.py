@@ -100,6 +100,38 @@ def test_history_prepend_relocates_cursor_and_loads_older(native_helper, tmp_pat
     assert older["at_start"] is False
 
 
+def test_lazy_prepend_reveals_relocated_page_before_returning(native_helper, tmp_path):
+    original = frame(20, 40)
+    latest = run_page(native_helper, tmp_path, frames=[original])
+    loaded = frame(0, 40, visible=list(range(20, 30)))
+    revealed = frame(0, 40, visible=list(range(5, 15)))
+    older = run_page(native_helper, tmp_path, "older", cursor=latest["cursor"],
+                     frames=[original, loaded, revealed])
+    assert older["ok"] and older["moved"] and not older["gap"]
+    assert ids(older) == revealed["ids"][5:25]
+    assert len(older["fixture_scrolls"]) == 2
+    assert older["fixture_scrolls"][-1] == {"target_id": revealed["ids"][5], "direction": "up", "edge": False}
+
+
+def test_lazy_prepend_followup_keeps_scroll_attempts_bounded(native_helper, tmp_path):
+    original = frame(20, 40)
+    latest = run_page(native_helper, tmp_path, frames=[original])
+    loaded = frame(0, 40, visible=list(range(20, 30)))
+    older = run_page(native_helper, tmp_path, "older", cursor=latest["cursor"], frames=[original, loaded])
+    assert older["gap"] and older["reason"] == "target_row_not_visible"
+    assert len(older["fixture_scrolls"]) == 3
+
+
+def test_lazy_prepend_followup_rejects_conversation_changes(native_helper, tmp_path):
+    original = frame(20, 40)
+    latest = run_page(native_helper, tmp_path, frames=[original])
+    loaded = frame(0, 40, visible=list(range(20, 30)))
+    changed = frame(0, 40, conversationID="different-chat")
+    older = run_page(native_helper, tmp_path, "older", cursor=latest["cursor"], frames=[original, loaded, changed])
+    assert not older["ok"] and older["reason"] == "conversation_changed"
+    assert older["rows"] == [] and older["cursor"] is None
+
+
 def test_current_preserves_exact_page_after_prepend_append_and_geometry_change(native_helper, tmp_path):
     latest = run_page(native_helper, tmp_path, frames=[frame(20, 40)])
     expanded = frame(0, 45)
@@ -230,6 +262,76 @@ def test_latest_boundary_requires_stable_exposed_inventory(native_helper, tmp_pa
                       frame(0, 40, bottomVerified=True), frame(0, 41, bottomVerified=True)])
     assert result["ok"] and not result["at_latest"]
     assert result["reason"] == "latest_boundary_unverified"
+
+
+def scrollbar_frame(*, short=False):
+    snapshot = frame(0, 8 if short else 21, scrollbar={"value": 0 if short else 1, "enabled": not short})
+    for index, row in enumerate(snapshot["rows"]):
+        row[0].update(y=100 + index * 50 if short else 600 - (21 - index) * 50, height=50)
+    if short:
+        snapshot["rows"][0][0]["height"] = 0
+        snapshot["visible"] = list(range(1, 8))
+    return snapshot
+
+
+def test_short_inbox_without_scroll_range_or_row_count_has_verified_boundaries(native_helper, tmp_path):
+    result = run_page(native_helper, tmp_path, "top", kind="inbox", frames=[scrollbar_frame(short=True)])
+    assert result["ok"] and result["single_chat_verified"]
+    assert result["at_top"] and result["at_end"] and not result["gap"]
+    assert result["row_count"] == 8
+
+
+@pytest.mark.parametrize("scrollbar", [
+    {"value": 1, "enabled": True},
+    {"value": 50, "minimum": 10, "maximum": 50, "enabled": True},
+])
+def test_latest_accepts_supported_scrollbar_ranges_without_optional_row_count(native_helper, tmp_path, scrollbar):
+    snapshot = scrollbar_frame()
+    snapshot["scrollbar"] = scrollbar
+    result = run_page(native_helper, tmp_path, frames=[snapshot])
+    assert result["ok"] and result["at_latest"] and not result["gap"]
+    assert not result["at_start"] and not result["history_boundary_verified"]
+    assert result["row_count"] == 20
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_bar", "missing_value", "out_of_range", "partial_range", "invalid_range",
+    "middle", "row_count_mismatch", "clipped_tail", "missing_tail_rect", "disabled_overflow",
+])
+def test_scrollbar_compatibility_keeps_unproven_boundaries_open(native_helper, tmp_path, mutation):
+    snapshot = scrollbar_frame()
+    if mutation == "missing_bar":
+        del snapshot["scrollbar"]
+    elif mutation == "missing_value":
+        del snapshot["scrollbar"]["value"]
+    elif mutation == "out_of_range":
+        snapshot["scrollbar"]["value"] = 2
+    elif mutation == "partial_range":
+        snapshot["scrollbar"]["minimum"] = 0
+    elif mutation == "invalid_range":
+        snapshot["scrollbar"].update(minimum=1, maximum=0)
+    elif mutation == "middle":
+        snapshot["scrollbar"]["value"] = 0.5
+    elif mutation == "row_count_mismatch":
+        snapshot["reportedCount"] = 22
+    elif mutation == "clipped_tail":
+        snapshot["rows"][-1][0]["y"] += 1
+    elif mutation == "missing_tail_rect":
+        snapshot["rows"][-1][0]["hasRect"] = False
+    elif mutation == "disabled_overflow":
+        snapshot["scrollbar"]["enabled"] = False
+    result = run_page(native_helper, tmp_path, frames=[snapshot])
+    assert result["ok"] and result["gap"] and not result["at_latest"]
+    assert result["reason"] == "latest_boundary_unverified"
+
+
+def test_disabled_scrollbar_never_proves_all_historical_messages_loaded(native_helper, tmp_path):
+    snapshot = scrollbar_frame(short=True)
+    latest = run_page(native_helper, tmp_path, frames=[snapshot])
+    older = run_page(native_helper, tmp_path, "older", frames=[snapshot], cursor=latest["cursor"])
+    assert latest["at_latest"]
+    assert older["gap"] and not older["at_start"] and not older["history_boundary_verified"]
+    assert older["reason"] == "history_boundary_unverified"
 
 
 def test_python_recovery_uses_identical_raw_message_parser(native_helper, tmp_path, monkeypatch):
@@ -505,6 +607,17 @@ def test_native_recovery_dispatch_calls_cursor_aware_sck_verifier():
     assert "verifyBubbleDirections(rows" in dispatch and "last: size, cursor: cursor" in dispatch
     assert "recoveryReveal(row:" in dispatch
     assert "last: 0" not in dispatch and "chatSnapshotContext" not in dispatch
+
+
+def test_navigation_spacers_and_additional_filters_do_not_hide_single_chat(native_helper, tmp_path):
+    navigation = [[], ['未读'], ['@我'], ['单聊'], ['群聊'], ['内部聊天'], ['外部聊天'], ['标记'], []]
+    cases = [navigation, navigation + [[]] * 11, navigation + [[]] * 12,
+             [['单聊'], ['普通客户']], navigation + [['单聊']]]
+    fixture = tmp_path / 'navigation.json'
+    fixture.write_text(json.dumps([{'navigationTexts': rows} for rows in cases]))
+    proc = subprocess.run([str(native_helper), 'single-chat-fixture', str(fixture)],
+                          check=True, capture_output=True, text=True, timeout=10)
+    assert [json.loads(line)['indices'] for line in proc.stdout.splitlines()] == [[3], [3], [], [], [3, 9]]
 
 
 def test_native_prepare_verifies_selection_after_navigation(native_helper, tmp_path):

@@ -199,7 +199,7 @@ def snapshot(*, limit: int = MAX_EVENTS) -> dict[str, Any]:
             (now, max(1, min(MAX_EVENTS, int(limit)))),
         ).fetchall()]
     from cli_anything.wecom_gui.core import recovery_state
-    return {"ok": True, "now": now, "states": states, "events": events, 'recovery': recovery_state.snapshot()}
+    return {"ok": True, "now": now, "states": states, "events": events, 'recovery': recovery_state.snapshot(include_details=True)}
 
 
 def record_supervisor(

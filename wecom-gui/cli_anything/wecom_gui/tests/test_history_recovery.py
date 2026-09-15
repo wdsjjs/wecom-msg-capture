@@ -75,6 +75,15 @@ def test_recovery_reads_backwards_in_twenty_row_pages_and_replays_without_duplic
     assert all(e['payload']['message']['source']['recovery_id'] == job['id'] for e in events()[10:])
     assert [e['payload']['message']['text'] for e in events()] == [m['text'] for m in messages]
     assert len([c for c in calls if c[0] == 'older']) == 3
+    local = recovery_state.snapshot(include_details=True)
+    assert len(local['recent_messages']) == 20
+    assert local['recent_messages'][0]['text'] == 'message-59'
+    assert local['recent_messages'][0]['registered'] is False
+    assert local['recent_chats'][0]['title'] == recovery['title']
+    assert local['recent_chats'][0]['status'] == 'completed'
+    assert local['recent_chats'][0]['pages'] > 0
+    assert 'recent_messages' not in recovery_state.snapshot()
+    assert 'recent_chats' not in recovery_state.snapshot()
     history_recovery._recover_chat(job, task)
     assert len(events()) == 60
 
