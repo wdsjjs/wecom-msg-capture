@@ -134,6 +134,12 @@ def _page(action='latest', cursor=None):
     messages = result.get('messages') or []
     if len(messages) > WINDOW:
         raise RecoveryGap('chat_window_contract_invalid')
+    # Preserve the original descriptors used for ledger matching. Only the
+    # attachment path treats known stickers as PNG frame candidates.
+    for message in messages:
+        if any(str(item.get('type') or 'image') in {'image', 'animated_sticker', 'sticker', 'emoji'}
+               and macos_backend._is_animated_sticker_media(item) for item in message.get('media') or []):
+            message['recovery_frame_candidate'] = True
     return {**result, 'messages': chat.infer_roles(messages),
             'hash': hashlib.sha256(json.dumps([m.get('text', '') for m in messages], ensure_ascii=False).encode()).hexdigest()}
 
@@ -243,6 +249,29 @@ def _capture_page(job, row, uid, key, saved):
 
     reader.reveal = reveal
 
+    def capture_frame(row_id):
+        _checkpoint(job)
+        observed = reader()
+        target = next((m for m in observed['messages'] if m.get('capture_row_id') == row_id), None)
+        if not target or len(target.get('media') or []) != 1:
+            raise RecoveryGap('frame_row_unverified')
+        reveal(row_id)
+        observed = reader()
+        target = next(m for m in observed['messages'] if m.get('capture_row_id') == row_id)
+        frame = macos_backend.capture_recovery_frame(target['row'], observed['cursor'], last=WINDOW,
+            animated=bool(target.get('recovery_frame_candidate')))
+        try:
+            if frame.get('capture_row_id') != row_id:
+                raise RecoveryGap('frame_row_changed')
+            reader()
+            _checkpoint(job)
+            return frame
+        except Exception:
+            edge_worker._discard_captured_media(frame.get('media') or [])
+            raise
+
+    reader.capture_frame = capture_frame
+
     fresh = reader()
     # Bring pending text bubbles into the viewport so direction comes from
     # actual pixels, never from wording or alternating speaker guesses.
@@ -250,13 +279,19 @@ def _capture_page(job, row, uid, key, saved):
         _checkpoint(job)
         if message.get('role') != 'unknown' or message.get('media') or not message.get('row'):
             continue
-        reveal(message.get('capture_row_id'))
+        try:
+            reveal(message.get('capture_row_id'))
+        except RecoveryGap as exc:
+            if str(exc) != 'recovery_row_not_visible':
+                raise
+            # Keep this row pending while other messages and attachments proceed.
+            continue
         observed = reader()
         fresh['messages'][index] = observed['messages'][index]
     candidates = edge_worker._visible_observation_fingerprints(fresh['messages'])
     result = edge_worker._capture_ordered_snapshot(row, fresh, uid, key, candidates,
         bootstrap_recent_count=len(candidates), recovery_id=job['id'], snapshot_reader=reader,
-        media_budget=edge_worker.MediaCaptureBudget())
+        media_budget=edge_worker.MediaCaptureBudget(seconds_limit=45))
     if not result.get('ok'):
         raise RecoveryGap(result.get('reason') or 'message_alignment_pending')
     return result

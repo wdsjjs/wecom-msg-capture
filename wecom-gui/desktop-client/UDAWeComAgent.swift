@@ -105,10 +105,17 @@ private struct RecoveryMessagePreview: Decodable {
     let observed_at: String
     let status: String
     let registered: Bool
+    let media_error: String?
+    let media_paused_reason: String?
+    let media_note: String?
     var summary: String {
-        let state = status == "delivered" ? "已上传" : registered ? "已登记，附件待完成" : "待登记"
-        let speaker = ["inbound": "客户", "outbound": "客服", "unknown": "方向待确认"][direction] ?? "方向待确认"
-        return "[\(state)] \(title) · \(speaker)：\(text)"
+        let state = status == "delivered" ? "已上传" : status == "waiting_media"
+            ? (registered ? "已登记，附件待完成" : "待登记，附件待完成") : registered ? "已登记，待上传" : "待登记"
+        let speaker = ["inbound": "客户", "outbound": "客服", "system": "企微系统", "unknown": "方向待确认"][direction] ?? "方向待确认"
+        let reasons = status == "waiting_media" ? [media_error, media_paused_reason].compactMap { $0 }.filter { !$0.isEmpty } : []
+        let detail = reasons.isEmpty ? "" : " · " + reasons.map(recoveryErrorLabel).joined(separator: "；")
+        let note = media_note.flatMap { $0.isEmpty ? nil : $0 }.map { " · \($0)" } ?? ""
+        return "[\(state)] \(title) · \(speaker)：\(text)\(note)\(detail)"
     }
 }
 
@@ -117,6 +124,11 @@ private func recoveryErrorLabel(_ code: String) -> String {
             "single_chat_not_selected": "未能确认企微单聊列表已选中", "single_chat_row_not_found": "未找到企微单聊入口",
             "conversation_open_unconfirmed": "会话未成功打开", "history_anchor_missing": "历史消息尚未对齐",
             "single_chat_prepare_unavailable": "无法切换到单聊列表", "inbox_page_unavailable": "会话列表读取失败",
+            "preview_image_not_found": "企微未打开图片大图", "preview_not_found": "企微未打开图片大图",
+            "media_fingerprint_changed": "图片画面变化，待重新核验", "media_fingerprint_unavailable": "未取得图片画面证据",
+            "media_row_identity_changed": "图片所在消息已变化，待重新核验", "media_not_visible": "图片尚未完整显示",
+            "media_retry_limit": "已达重试上限", "media_capture_interrupted": "图片读取中断",
+            "media_capture_skipped": "此附件暂不支持读取大图", "media_capture_disabled": "图片读取已关闭",
             "accessibility_denied": "缺少无障碍权限", "window_not_on_screen": "企微窗口不在屏幕中"][code] ?? code
 }
 
@@ -928,6 +940,19 @@ private func testClick(_ view: FloatingDashboardView, _ x: CGFloat, _ y: CGFloat
 }
 
 private func testRecoveryDecodingAndModes() {
+    let messageJSON = #"{"title":"Test chat","text":"[图片]","direction":"inbound","observed_at":"","status":"waiting_media","registered":true}"#
+    let oldMessage = try! JSONDecoder().decode(RecoveryMessagePreview.self, from: Data(messageJSON.utf8))
+    precondition(oldMessage.media_error == nil && oldMessage.summary.contains("附件待完成"))
+    var pending = try! JSONSerialization.jsonObject(with: Data(messageJSON.utf8)) as! [String: Any]
+    pending["media_error"] = "preview_image_not_found"
+    pending["media_paused_reason"] = "media_retry_limit"
+    pending["media_note"] = "动态表情截图"
+    let failed = try! JSONDecoder().decode(RecoveryMessagePreview.self, from: JSONSerialization.data(withJSONObject: pending))
+    precondition(failed.summary.contains("企微未打开图片大图") && failed.summary.contains("已达重试上限"))
+    precondition(failed.summary.contains("动态表情截图"))
+    pending["status"] = "delivered"
+    let delivered = try! JSONDecoder().decode(RecoveryMessagePreview.self, from: JSONSerialization.data(withJSONObject: pending))
+    precondition(delivered.summary.contains("已上传") && !delivered.summary.contains("重试上限"))
     let legacy = decodeTestSnapshot(testSnapshotJSON())
     precondition(legacy.recovery == nil && !legacy.holdsNormalOperation && !legacy.canPauseRecovery)
     let sparse = decodeTestSnapshot(#"{"states":[],"events":[],"recovery":{"status":"paused","pending_media":null}}"#)

@@ -28,6 +28,7 @@ def recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(history_recovery, '_locate', lambda row, **k: row)
     monkeypatch.setattr(history_recovery.macos_backend, 'reveal_chat_row', lambda *a, **k: None)
     monkeypatch.setattr(history_recovery.macos_backend, 'recovery_prepare_inbox', lambda: {'ok': True})
+    monkeypatch.setattr(history_recovery.macos_backend, 'capture_recovery_frame', Mock(side_effect=RuntimeError('fixture_frame_unavailable')))
     return row
 
 
@@ -86,6 +87,184 @@ def test_recovery_reads_backwards_in_twenty_row_pages_and_replays_without_duplic
     assert 'recent_chats' not in recovery_state.snapshot()
     history_recovery._recover_chat(job, task)
     assert len(events()) == 60
+
+
+def test_local_details_show_media_failure_and_pause_without_changing_registration(recovery, monkeypatch):
+    image = message(0, text='[图片]')
+    image['media'] = [{'type': 'image'}]
+    monkeypatch.setattr(edge_worker, '_prepare_snapshot_media', lambda *a, **k: None)
+    seed(recovery, [image])
+    original = events()[0]
+    job, _ = task_for(recovery)
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute('SELECT * FROM edge_message_ledger').fetchone())
+        conn.execute("UPDATE edge_media_capture_state SET attempts=?, paused_reason='media_retry_limit'",
+                     (edge_message_ledger.MEDIA_ATTEMPT_LIMIT,))
+    edge_message_ledger.save_media(entry, [], error='preview_image_not_found', complete=False)
+    recovery_state.link_messages(job['id'], [entry])
+    local = recovery_state.snapshot(include_details=True)['recent_messages'][0]
+    assert local['media_error'] == 'preview_image_not_found'
+    assert local['media_paused_reason'] == 'media_retry_limit'
+    assert local['status'] == 'waiting_media'
+    assert 'media_error' not in json.dumps(recovery_state.snapshot())
+    assert 'preview_image_not_found' not in json.dumps(recovery_state.snapshot())
+    assert events()[0]['payload'] == original['payload']
+    with edge_state._connect() as conn:
+        conn.execute("UPDATE edge_inbound_events SET status='delivered'")
+    complete = recovery_state.snapshot(include_details=True)['recent_messages'][0]
+    assert complete['media_error'] == complete['media_paused_reason'] == ''
+
+
+def test_local_details_work_before_media_ledger_exists(recovery):
+    recovery_state.request_start()
+    assert recovery_state.snapshot(include_details=True)['recent_messages'] == []
+
+
+@pytest.mark.parametrize('failure', ['media_fingerprint_changed', 'preview_image_not_found', 'known_sticker'])
+def test_recovery_frame_repairs_attachment_without_replacing_identity_or_pinned_pixels(recovery, monkeypatch, tmp_path, failure):
+    image = message(1, text='[图片]')
+    image['direction_evidence']['imageFingerprint'] = 'original-frame'
+    image['media'] = [{'type': 'animated_sticker' if failure == 'known_sticker' else 'image'}]
+    messages = [message(0), image, message(2)]
+    with monkeypatch.context() as preparing:
+        preparing.setattr(edge_worker, '_prepare_snapshot_media', lambda *a, **k: None)
+        seed(recovery, messages)
+    before = events()
+    for item in before:
+        edge_state.mark_registered(item['client_event_id'], item['payload']['message']['direction'])
+    with edge_message_ledger.transaction() as conn:
+        old_entry = dict(conn.execute('SELECT * FROM edge_message_ledger WHERE sequence=2').fetchone())
+    pinned = edge_message_ledger.media_state(old_entry)
+    pager(monkeypatch, messages)
+    monkeypatch.setattr(history_recovery.macos_backend, 'recovery_reveal_chat_row', lambda *a, **k: {'ok': True})
+    output = tmp_path / 'wecom-message-single-frame-fixture.png'
+    def frame(row, cursor, *, last, animated):
+        assert row == 2 and last == 20
+        assert animated == (failure == 'known_sticker')
+        output.write_bytes(b'\x89PNG\r\n\x1a\n' + b'frame' * 10)
+        return {'capture_row_id': 'ax-1',
+            'direction_evidence': {**image['direction_evidence'], 'imageFingerprint': 'new-frame'},
+            'media': [{'type': 'image', 'capture_path': str(output), 'capture_mode': 'single_frame',
+                       'frame_kind': 'animated-sticker' if animated else 'message'}]}
+    capture_frame = Mock(side_effect=frame)
+    monkeypatch.setattr(history_recovery.macos_backend, 'capture_recovery_frame', capture_frame)
+    if failure == 'media_fingerprint_changed':
+        ordinary = Mock(side_effect=edge_worker.MediaCapturePending(failure))
+    else:
+        ordinary = Mock(return_value={'media': [{'type': 'image', 'error': failure}], 'direction_evidence': {}})
+    monkeypatch.setattr(edge_worker, '_capture_snapshot_image', ordinary)
+    job, task = task_for(recovery)
+    history_recovery._recover_chat(job, task)
+    capture_frame.assert_called_once()
+    repaired = next(e for e in events() if e['payload']['message']['id'] == old_entry['event_id'])
+    if failure != 'known_sticker':
+        for key in ('id', 'hash', 'text', 'source', 'direction'):
+            assert repaired['payload']['message'][key] == before[1]['payload']['message'][key]
+        assert repaired['payload']['occurred_at'] == before[1]['payload']['occurred_at']
+        assert repaired['client_event_id'] == before[1]['client_event_id']
+        assert edge_message_ledger.media_state(old_entry)['image_fingerprint'] == pinned['image_fingerprint']
+    else:
+        ordinary.assert_not_called()
+        assert repaired['payload']['message']['source']['recovery_id'] == job['id']
+    assert repaired['media'][0]['capture_mode'] == 'single_frame'
+    assert repaired['status'] == 'pending' and len(events()) == 3
+    assert 'capture_mode' not in repaired['payload']['message']['media'][0]
+    detail = next(m for m in recovery_state.snapshot(include_details=True)['recent_messages'] if m['media_note'])
+    assert detail['media_note'] == ('动态表情截图' if failure == 'known_sticker' else '图片单帧截图')
+    assert 'media_note' not in json.dumps(recovery_state.snapshot())
+    client = Mock(supports_history_recovery=True, supports_deferred_media=True)
+    edge_worker.flush_registrations(client)
+    edge_worker.flush_inbound(client)
+    assert next(e for e in events() if e['payload']['message']['id'] == old_entry['event_id'])['status'] == 'delivered'
+    client.pull_command.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['media_conversation_changed', 'media_row_identity_changed', 'media_snapshot_changed', 'media_fingerprint_unavailable'])
+def test_recovery_frame_does_not_bypass_identity_visibility_or_scope_failures(recovery, monkeypatch, failure):
+    image = message(0, text='[图片]')
+    image['media'] = [{'type': 'image'}]
+    pager(monkeypatch, [image, message(1)])
+    monkeypatch.setattr(edge_worker, '_capture_snapshot_image', Mock(side_effect=edge_worker.MediaCapturePending(failure)))
+    job, task = task_for(recovery)
+    history_recovery._recover_chat(job, task)
+    history_recovery.macos_backend.capture_recovery_frame.assert_not_called()
+    assert events()[0]['status'] == 'waiting_media'
+
+
+def test_changed_page_after_frame_capture_discards_file_and_keeps_pending(recovery, monkeypatch, tmp_path):
+    image = message(0, text='[动画表情]')
+    image['media'] = [{'type': 'animated_sticker'}]
+    pager(monkeypatch, [image])
+    monkeypatch.setattr(history_recovery.macos_backend, '_image_capture_dir', lambda: tmp_path)
+    monkeypatch.setattr(history_recovery.macos_backend, 'recovery_reveal_chat_row', lambda *a, **k: {'ok': True})
+    output = tmp_path / 'frame.png'
+    def capture(*a, **k):
+        output.write_bytes(b'\x89PNG\r\n\x1a\n' + b'frame' * 10)
+        image['capture_row_id'] = 'different-row'
+        return {'capture_row_id': 'ax-0', 'direction_evidence': image['direction_evidence'],
+                'media': [{'type': 'image', 'capture_mode': 'single_frame', 'capture_path': str(output)}]}
+    monkeypatch.setattr(history_recovery.macos_backend, 'capture_recovery_frame', capture)
+    job, task = task_for(recovery)
+    history_recovery._recover_chat(job, task)
+    assert not output.exists()
+    assert events()[0]['status'] == 'waiting_media'
+
+
+@pytest.mark.parametrize('failure', ['recovery_row_not_visible', 'conversation_changed'])
+def test_unrevealed_text_keeps_pending_without_blocking_images_but_identity_changes_abort(recovery, monkeypatch, tmp_path, failure):
+    image = message(1, text='[图片]')
+    image['media'] = [{'type': 'image'}]
+    image['direction_evidence']['imageFingerprint'] = 'fixture-image'
+    messages = [message(0, direction='unknown'), image, message(2)]
+    pager(monkeypatch, messages)
+    monkeypatch.setattr(history_recovery.macos_backend, 'recovery_reveal_chat_row', lambda *a, **k: {'ok': False, 'reason': failure})
+    path = tmp_path / 'image.png'
+    path.write_bytes(b'\x89PNG\r\n\x1a\n' + b'0' * 32)
+    capture = Mock(return_value={'media': [{'type': 'image', 'capture_path': str(path)}], 'direction_evidence': image['direction_evidence']})
+    monkeypatch.setattr(edge_worker, '_capture_snapshot_image', capture)
+    job, task = task_for(recovery)
+    if failure == 'conversation_changed':
+        with pytest.raises(history_recovery.RecoveryGap, match=failure):
+            history_recovery._recover_chat(job, task)
+        capture.assert_not_called()
+        assert events() == []
+    else:
+        history_recovery._recover_chat(job, task)
+        assert events()[0]['payload']['message']['direction'] == 'unknown'
+        assert events()[1]['media'][0]['capture_path'] == str(path)
+        assert events()[2]['payload']['message']['source']['recovery_id'] == job['id']
+        assert recovery_state.snapshot()['pending_direction'] == 1
+
+
+def test_resolved_system_notice_preserves_original_registration_and_clears_direction_pending(recovery, monkeypatch):
+    notice = message(0, direction='unknown', text='你已添加了测试联系人，现在可以开始聊天了。')
+    seed(recovery, [notice])
+    original = events()[0]
+    edge_state.mark_registered(original['client_event_id'], 'unknown')
+    edge_state.mark_inbound_delivered(original['client_event_id'])
+    notice['direction_evidence']['status'] = 'system_notice'
+    pager(monkeypatch, [notice, message(1)])
+    job, task = task_for(recovery)
+    history_recovery._recover_chat(job, task)
+    assert len(events()) == 2
+    assert events()[0]['payload'] == original['payload']
+    view = recovery_state.snapshot(include_details=True)
+    assert view['pending_direction'] == 0
+    assert view['recent_messages'][-1]['direction'] == 'system'
+    with edge_message_ledger.transaction() as conn:
+        system = conn.execute('SELECT capture_status,direction FROM edge_message_ledger ORDER BY sequence LIMIT 1').fetchone()
+    assert tuple(system) == ('ignored', 'system')
+
+
+def test_new_system_notice_retains_ledger_position_without_customer_event(recovery, monkeypatch):
+    notice = message(0, direction='unknown', text='你已添加了测试联系人，现在可以开始聊天了。')
+    notice['direction_evidence']['status'] = 'system_notice'
+    pager(monkeypatch, [notice, message(1)])
+    job, task = task_for(recovery)
+    history_recovery._recover_chat(job, task)
+    assert len(events()) == 1
+    assert events()[0]['payload']['message']['text'] == 'message-1'
+    assert events()[0]['payload']['message']['source']['sequence'] == 2
 
 
 def test_resume_after_partial_commit_reuses_message_ids(recovery, monkeypatch):
@@ -531,7 +710,8 @@ def test_ambiguous_suffix_does_not_reuse_arbitrary_message_identity(recovery, mo
 
 
 @pytest.mark.parametrize('clip_older_prefix', [False, True])
-def test_old_page_image_uses_cursor_reveal_and_same_page_verification(recovery, monkeypatch, tmp_path, clip_older_prefix):
+@pytest.mark.parametrize('reopened', [False, True])
+def test_old_page_image_uses_cursor_reveal_and_same_page_verification(recovery, monkeypatch, tmp_path, clip_older_prefix, reopened):
     page_cursor = {'start': 0}
     shown = False
     saved_image = tmp_path / 'captured.png'
@@ -539,7 +719,9 @@ def test_old_page_image_uses_cursor_reveal_and_same_page_verification(recovery, 
 
     def image_page():
         image = message(1, text='[图片]')
-        image['direction_evidence']['imageFingerprint'] = 'fixture-pixels'
+        image['capture_row_id'] = 'pid:launch:current-row'
+        if shown:
+            image['direction_evidence']['imageFingerprint'] = 'fixture-pixels'
         image['media'] = [{'type': 'image', 'rect': {'x': 10, 'y': 10 if shown else 900, 'width': 30, 'height': 30},
                            'chat_viewport': {'x': 0, 'y': 0, 'width': 500, 'height': 500}}]
         return {'ok': True, 'messages': [message(0), image, message(2)], 'cursor': page_cursor,
@@ -563,10 +745,15 @@ def test_old_page_image_uses_cursor_reveal_and_same_page_verification(recovery, 
     monkeypatch.setattr(edge_worker.macos_backend, 'reveal_chat_row', Mock(side_effect=AssertionError('must use recovery cursor')))
     monkeypatch.setattr(edge_worker.macos_backend, 'capture_chat_images', lambda messages, **k: [
         {**m, 'media': [{**item, 'capture_path': str(saved_image)} for item in m['media']]} for m in messages])
-    if clip_older_prefix:
+    if clip_older_prefix or reopened:
         with monkeypatch.context() as pending_media:
             pending_media.setattr(edge_worker, '_prepare_snapshot_media', lambda *a, **k: None)
-            seed(recovery, image_page()['messages'][1:])
+            original = image_page()['messages'][1 if clip_older_prefix else 0:]
+            old_image = next(m for m in original if m.get('media'))
+            old_image['direction_evidence']['imageFingerprint'] = 'fixture-pixels'
+            old_image['capture_row_id'] = 'pid:launch:old-row' if reopened else 'pid:launch:current-row'
+            seed(recovery, original)
+    original_events = events() if reopened else []
     job, task = task_for(recovery)
     if clip_older_prefix:
         with pytest.raises(history_recovery.RecoveryGap, match='earlier_history_unregistered'):
@@ -575,8 +762,11 @@ def test_old_page_image_uses_cursor_reveal_and_same_page_verification(recovery, 
         history_recovery._recover_chat(job, task)
     reveal_call.assert_called_once_with(2, page_cursor, last=20)
     image = events()[0 if clip_older_prefix else 1]
-    if not clip_older_prefix:
+    if not clip_older_prefix and not reopened:
         assert image['payload']['message']['source']['recovery_id'] == job['id']
+    if reopened:
+        assert image['payload']['message']['source'] == original_events[0 if clip_older_prefix else 1]['payload']['message']['source']
+        assert image['client_event_id'] == original_events[0 if clip_older_prefix else 1]['client_event_id']
     assert image['payload']['message']['direction'] == 'inbound'
     assert image['media'][0]['capture_path'] == str(saved_image)
     assert len(events()) == (2 if clip_older_prefix else 3)

@@ -55,7 +55,42 @@ exposed list boundary when all loaded rows fit inside the viewport. Lazy history
 loads get at most two additional targeted scrolls to reveal the relocated page,
 with cursor and conversation identity checked again after every move. These
 checks confirm the visible list/latest edge, never the beginning of all history.
+Direction capture explicitly crops the ScreenCaptureKit content rectangle into
+window-local coordinates, including fullscreen windows with a menu strip. A
+centered add-contact notice without a speech bubble is a system record, not a
+customer/staff turn; previously registered payloads remain unchanged. A text row
+that cannot be revealed stays pending without blocking later images on its page.
 Pictures use the same-page identity and pixel checks before and after capture.
+Reopening a chat can rebuild AX row handles within the same process. Recovery may
+rebind such an image only after page validation and an exact pinned-pixel match.
+Original attachment repairs still require those pinned pixels. Recovery also
+supports an explicitly labelled PNG observation: known stickers use a single
+frame, and a single-image row with changing pixels or no usable preview can fall
+back to a frame snapshot. This is a screenshot of the recovered row, not the
+original image or animation file. Existing pinned evidence is retained.
+The native helper exports that crop and its direction from the same SCK image,
+after validating the whole cursor page and row geometry. The page and customer
+identity are checked again before the PNG enters the spool. A changed row,
+conversation, ambiguous bubble, hidden image or missing pixel evidence remains
+pending; files from invalidated captures are removed.
+Frames retain message IDs, timestamps, sequences and recovery source fields.
+Only attachment data is repaired. Local details label explicit stickers as
+`动态表情截图`, and unlabeled image observations as `图片单帧截图`; a failed
+preview alone does not classify a message as animated. PNG filenames also carry
+`single-frame`, using the existing upload contract without adding schema fields.
+This fallback is recovery-only and never opens a send path or starts local AI.
+Local message details show the last image-capture failure and any retry-limit
+pause separately. A failed image preview is not proof of an animated sticker.
+These optional detail fields stay out of telemetry and message registrations;
+they disappear once the attachment has been delivered.
+Image capture and cleanup inspect only a verified preview window, using its
+image label and preview controls (including AXHelp labels). They do not scan
+the chat behind it or treat an arbitrary detached window as an image viewer.
+Actual AX image bounds take precedence over the window-content fallback.
+Recovery AX calls have a separate 20-second timeout, overridable with
+`WECOM_GUI_AX_RECOVERY_TIMEOUT`. One page has a 45-second media budget; ordinary
+collection retains its existing budget. Original captures use pixel rechecks;
+single frames use the validated same-frame evidence described above.
 Older pending images and uncertain directions determine how far recovery goes
 back, even beyond the ordinary 200-entry matching window. Clicking recovery again
 grants paused images one new retry budget while preserving their event identities

@@ -71,6 +71,37 @@ def ids(page):
     return [row["captureRowId"] for row in page["rows"]]
 
 
+def test_preview_requires_image_title_and_preview_controls(native_helper, tmp_path):
+    fixture = tmp_path / 'previews.json'
+    fixture.write_text(json.dumps([
+        {'values': ['图片', '上一张', '保存到本地']}, {'values': ['Image', '放大']},
+        {'values': []}, {'values': ['图片']}, {'values': ['放大', '关闭']}, {'values': ['这张图片', '保存到本地']},
+        {'values': ['图片', ''], 'help': ['上一张', '保存到本地']},
+    ]))
+    proc = subprocess.run([str(native_helper), 'preview-evidence-fixture', str(fixture)],
+                          check=True, capture_output=True, text=True, timeout=10)
+    assert [json.loads(line)['ok'] for line in proc.stdout.splitlines()] == [True, True, False, False, False, False, True]
+
+
+def test_preview_image_exceeds_bubble_limit_without_cropping_image_sides(native_helper, tmp_path):
+    window = {'x': 400, 'y': 200, 'width': 640, 'height': 480}
+    rect = {'x': 399, 'y': 231, 'width': 642, 'height': 402}
+    fixture = tmp_path / 'preview-bounds.json'
+    fixture.write_text(json.dumps([
+        {'rect': rect, 'window': window},
+        {'rect': {'x': 400, 'y': 200, 'width': 1280, 'height': 900},
+         'window': {'x': 400, 'y': 180, 'width': 1440, 'height': 1000}},
+        {'rect': rect, 'window': window, 'role': 'AXGroup'},
+        {'rect': {**rect, 'x': 2000}, 'window': window},
+    ]))
+    proc = subprocess.run([str(native_helper), 'preview-evidence-fixture', str(fixture)],
+                          check=True, capture_output=True, text=True, timeout=10)
+    results = [json.loads(line) for line in proc.stdout.splitlines()]
+    assert {k: results[0][k] for k in ('x', 'y', 'width', 'height')} == {**rect, 'x': 400, 'width': 640}
+    assert results[1]['width'] == 1280 and results[1]['height'] == 900
+    assert results[2:] == [{}, {}]
+
+
 def test_chat_walks_older_then_replays_newer_with_overlap(native_helper, tmp_path):
     latest = run_page(native_helper, tmp_path, frames=[frame(bottomVerified=True)])
     assert latest["ok"] and latest["at_latest"] and not latest["at_start"]
@@ -442,6 +473,62 @@ def pixel_fixture(tmp_path):
     write_png(path, 700, 500, [(16, 30, 180, 40, (232, 232, 233)),
                                (484, 130, 200, 40, (207, 230, 253))])
     return {"imagePath": str(path), "window": VIEWPORT}
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_native_frame_exports_verified_pixels_and_deletes_them_if_page_changes(native_helper, tmp_path, changed):
+    from cli_anything.wecom_gui.tests.test_bubble_geometry import write_png
+    import struct
+
+    snapshot = frame(0, 1, visible=[0], fullyVisible=[0])
+    snapshot['rows'] = [[node('AXRow', depth=0, y=120, width=700, height=160),
+                         node('AXImage', ['动画表情'], y=140, width=100, height=100)]]
+    snapshot['rows'][0][1]['x'] = 316
+    cursor = run_page(native_helper, tmp_path, frames=[snapshot])['cursor']
+    digests = []
+    for index, color in enumerate([(100, 50, 150), (60, 160, 90)]):
+        image = tmp_path / f'animation-{index}.png'
+        output = tmp_path / f'frame-{index}.png'
+        write_png(image, 700, 500, [(16, 40, 100, 100, color)])
+        after = copy.deepcopy(snapshot)
+        if changed:
+            after['conversationID'] = 'other-chat'
+        page = run_page(native_helper, tmp_path, 'current', cursor=cursor,
+            frames=[snapshot, snapshot, snapshot, snapshot, after],
+            imagePath=str(image), window=VIEWPORT, frameOutput=str(output), frameRowID=snapshot['ids'][0])
+        if changed:
+            assert not page['ok'] and not output.exists()
+        else:
+            assert page['frame']['ok'] and page['frame']['capture_row_id'] == snapshot['ids'][0]
+            assert page['frame']['direction_evidence'] == page['rows'][0]['directionEvidence']
+            assert page['frame']['direction_evidence']['side'] == 'left'
+            assert struct.unpack('>II', output.read_bytes()[16:24]) == (100, 100)
+            digests.append(page['frame']['direction_evidence']['imageFingerprint'])
+    if not changed:
+        assert digests[0] != digests[1]
+
+
+@pytest.mark.parametrize('native_error', [False, True])
+def test_python_frame_result_is_local_png_and_failures_remove_partial_files(monkeypatch, tmp_path, native_error):
+    monkeypatch.setattr(backend, '_image_capture_dir', lambda: tmp_path)
+    def native(command):
+        assert command[:3] == ['recovery-chat-frame', '2', '20']
+        output = Path(command[4])
+        assert 'single-frame' in output.name and output.suffix == '.png'
+        output.write_bytes(b'\x89PNG\r\n\x1a\n' + b'pixels' * 10)
+        if native_error:
+            return [{'ok': False, 'reason': 'conversation_changed'}]
+        return [{'ok': True, 'path': str(output), 'capture_row_id': 'row-2', 'cursor': {'page': 1},
+                 'direction_evidence': {'source': 'screencapturekit', 'status': 'matched', 'side': 'left', 'imageFingerprint': 'pixels'}}]
+    monkeypatch.setattr(backend, '_swift_ax', native)
+    if native_error:
+        with pytest.raises(RuntimeError, match='conversation_changed'):
+            backend.capture_recovery_frame(2, {'page': 1})
+        assert list(tmp_path.iterdir()) == []
+    else:
+        result = backend.capture_recovery_frame(2, {'page': 1}, animated=True)
+        assert result['media'][0]['capture_mode'] == 'single_frame'
+        assert result['media'][0]['frame_kind'] == 'animated-sticker'
 
 
 def historical_page(binary, tmp_path, snapshot=None):

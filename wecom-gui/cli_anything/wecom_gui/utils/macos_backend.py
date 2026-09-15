@@ -473,6 +473,8 @@ def _swift_ax(command: str | list[str]) -> list[dict]:
         "chat": os.environ.get("WECOM_GUI_AX_CHAT_TIMEOUT", "8"),
         "chat-all": os.environ.get("WECOM_GUI_AX_CHAT_ALL_TIMEOUT", os.environ.get("WECOM_GUI_AX_CHAT_TIMEOUT", "8")),
         "geometry": os.environ.get("WECOM_GUI_AX_GEOMETRY_TIMEOUT", "5"),
+        **{name: os.environ.get("WECOM_GUI_AX_RECOVERY_TIMEOUT", "20") for name in
+           ("recovery-chat-page", "recovery-chat-reveal", "recovery-chat-frame", "recovery-inbox-page")},
     }
     default_timeout = command_timeouts.get(args[0], "2" if args and args[0] in scan_commands else "8") if args else "8"
     timeout = float(os.environ.get("WECOM_GUI_AX_TIMEOUT", default_timeout))
@@ -2034,7 +2036,7 @@ def _chat_messages_from_ax_items(
     return messages[-last:] if last > 0 else messages
 
 
-def _recovery_ax_result(command: str, value: str, size: int, cursor: dict | None) -> tuple[dict, int]:
+def _recovery_ax_result(command: str, value: str, size: int, cursor: dict | None, *extra: str) -> tuple[dict, int]:
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise ValueError("recovery page size must be a positive integer")
     if cursor is not None and not isinstance(cursor, dict):
@@ -2043,9 +2045,30 @@ def _recovery_ax_result(command: str, value: str, size: int, cursor: dict | None
     encoded_cursor = json.dumps(cursor, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(encoded_cursor) > 32768:
         raise ValueError("recovery cursor exceeds 32768 bytes")
-    items = _swift_ax([command, value, str(size), encoded_cursor])
+    items = _swift_ax([command, value, str(size), encoded_cursor, *extra])
     result = dict(items[-1]) if items and isinstance(items[-1], dict) else {}
     return result, size
+
+
+def capture_recovery_frame(row: int, cursor: dict, *, last: int = 20, animated: bool = False) -> dict:
+    """Export one frame from the same SCK image used to verify a recovery row."""
+    kind = 'animated-sticker' if animated else 'message'
+    output = _image_capture_dir() / f'wecom-{kind}-single-frame-{uuid.uuid4().hex}.png'
+    try:
+        result, _ = _recovery_ax_result('recovery-chat-frame', str(row), last, cursor, str(output))
+        evidence = result.get('direction_evidence') or {}
+        if (result.get('ok') is not True or result.get('path') != str(output)
+                or not result.get('capture_row_id') or not result.get('cursor')
+                or evidence.get('source') != 'screencapturekit' or evidence.get('status') != 'matched'
+                or not evidence.get('imageFingerprint') or not validate_image_file(output)):
+            raise RuntimeError(str(result.get('reason') or result.get('error') or 'frame_capture_unverified'))
+        return {'media': [{'type': 'image', 'capture_ok': True, 'capture_path': str(output),
+                           'capture_mode': 'single_frame', 'frame_kind': kind,
+                           'capture_rect': result.get('rect') or {}}],
+                'direction_evidence': evidence, 'capture_row_id': result['capture_row_id']}
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
 
 
 def _recovery_page(kind: str, action: str, size: int, cursor: dict | None) -> dict:

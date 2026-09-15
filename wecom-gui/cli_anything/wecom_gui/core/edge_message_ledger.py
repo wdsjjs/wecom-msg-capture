@@ -290,7 +290,7 @@ def media_fingerprints_match(expected: str, observed: str, *, allow_render_drift
     return sum(smoothed) <= 3.2 * 25 * len(smoothed)
 
 
-def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = False):
+def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = False, recovery_page_verified: bool = False):
     row_id = str(message.get("capture_row_id") or "")
     fingerprint = str((message.get("direction_evidence") or {}).get("imageFingerprint") or "")
     if is_loading_image_fingerprint(fingerprint):
@@ -309,10 +309,10 @@ def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = 
         if anchor and fingerprint and not media_fingerprints_match(anchor, fingerprint):
             raise MediaIdentityError("media_fingerprint_changed")
         if old["capture_row_id"] and old["capture_row_id"] != row_id:
-            # An app restart invalidates AX handles. Rebind only with already pinned
-            # pixels and the ordered ledger; never on another identical placeholder.
+            # Reopening history also rebuilds AX rows. A verified recovery page
+            # may rebind only with exact pinned pixels and ordered ledger alignment.
             restarted = old["capture_row_id"].rsplit(":", 1)[0] != row_id.rsplit(":", 1)[0]
-            if not (restarted and fingerprint and media_fingerprints_match(
+            if not ((restarted or recovery_page_verified) and fingerprint and media_fingerprints_match(
                     anchor, fingerprint, allow_render_drift=False)):
                 raise MediaIdentityError("media_row_identity_changed")
         # Replace an old loading sample only on its original AX row; real anchors never drift.

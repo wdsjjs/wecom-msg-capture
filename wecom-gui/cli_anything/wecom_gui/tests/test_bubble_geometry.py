@@ -39,6 +39,12 @@ def test_failed_visual_check_never_falls_back_to_legacy_position_guess(status):
     assert all(item["role"] == "unknown" and item["role_confidence"] == "low" for item in messages)
 
 
+def test_verified_system_notice_has_no_customer_or_staff_direction():
+    messages = chat.infer_roles([{'text': 'notice', 'direction_evidence': evidence('unknown', 'system_notice')}])
+    assert messages[0]['role'] == '系统'
+    assert messages[0]['role_confidence'] == 'high'
+
+
 def test_timestamp_is_separate_from_body_and_legacy_identity_is_preserved(monkeypatch):
     row = {"index": 8, "x": 411, "width": 698,
            "texts": ["星期日 13:38", "叶黄素有什么好处？"],
@@ -129,6 +135,41 @@ def test_native_input_preflight_accepts_empty_but_rejects_drafts_and_unreadable_
     assert all(result["error"] == "chat_input_value_unavailable" for result in results[6:])
     assert all(result["submitted"] is False for result in results)
     assert "draft" not in completed.stdout
+
+
+def test_window_capture_crops_system_strip_and_preserves_window_coordinates(native_helper, tmp_path):
+    window = {'x': 0, 'y': 33, 'width': 1470, 'height': 923}
+    shifted = {'x': 180, 'y': 90, 'width': 1470, 'height': 923}
+    fixture = tmp_path / 'capture-config.json'
+    fixture.write_text(json.dumps([
+        {'window': window, 'content': window}, {'window': window, 'content': shifted},
+        {'window': window, 'content': {**window, 'width': 1400}},
+    ]))
+    result = subprocess.run([str(native_helper), 'capture-config-fixture', str(fixture)],
+                            check=True, capture_output=True, text=True, timeout=10)
+    first, moved, invalid = [json.loads(line) for line in result.stdout.splitlines()]
+    assert first['source'] == window and moved['source'] == shifted
+    assert first['destination'] == moved['destination'] == {**window, 'x': 0, 'y': 0}
+    assert first['width'] == 1470 and first['height'] == 923
+    assert first['scalesToFit'] and not first['preservesAspectRatio']
+    assert invalid == {'ok': False}
+
+
+@pytest.mark.parametrize('bubble,centered,expected', [(False, True, 'system_notice'), (True, False, 'matched'), (False, False, 'no_matching_bubble')])
+def test_system_notice_requires_centered_text_without_a_speech_bubble(native_helper, tmp_path, bubble, centered, expected):
+    screenshot = tmp_path / 'notice.png'
+    write_png(screenshot, 400, 200, [(10, 30, 220, 40, (232, 232, 233))] if bubble else [])
+    body = {'role': 'AXTextArea', 'subrole': '', 'texts': ['你已添加了测试联系人，现在可以开始聊天了。'],
+            'x': 100 if centered else 20, 'y': 40, 'width': 200, 'height': 20, 'hasRect': True, 'selected': False, 'depth': 2}
+    viewport = {'x': 0, 'y': 0, 'width': 400, 'height': 200}
+    fixture = tmp_path / 'notice.json'
+    fixture.write_text(json.dumps({'kind': 'chat', 'action': 'latest', 'size': 20,
+        'imagePath': str(screenshot), 'window': viewport,
+        'frames': [{'rows': [[{**body, **viewport, 'role': 'AXRow', 'texts': [], 'depth': 0}, body]],
+                    'ids': ['notice-row'], 'viewport': viewport, 'visible': [0], 'bottomVerified': True}]}))
+    result = subprocess.run([str(native_helper), 'recovery-fixture', str(fixture)], check=True, capture_output=True, text=True, timeout=10)
+    row = json.loads(result.stdout)['rows'][0]
+    assert row['directionEvidence']['status'] == expected
 
 
 def write_png(path, width, height, rectangles):

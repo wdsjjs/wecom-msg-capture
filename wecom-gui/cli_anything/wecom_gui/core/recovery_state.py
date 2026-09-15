@@ -212,6 +212,10 @@ def snapshot(*, include_details: bool = False) -> dict:
         if not row:
             return {'status': 'idle', 'desired_mode': 'normal'}
         job = dict(row)
+        has_ledger = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_message_ledger'").fetchone()
+        system_notice = ("EXISTS (SELECT 1 FROM edge_message_ledger l WHERE "
+                         "e.dedupe_key=l.conversation_key||':'||l.event_hash "
+                         "AND l.capture_status='ignored' AND l.direction='system')") if has_ledger else '0'
         counts = {r[0]: r[1] for r in conn.execute('SELECT status, count(*) FROM edge_history_recovery_chat WHERE recovery_id=? GROUP BY status', (job['id'],))}
         stats = conn.execute("""SELECT count(*) AS total,
             coalesce(sum(registered_direction != '' OR status='delivered'),0) AS registered,
@@ -220,31 +224,42 @@ def snapshot(*, include_details: bool = False) -> dict:
             FROM edge_inbound_events WHERE json_extract(payload_json,'$.message.source.recovery_id')=?
             OR client_event_id IN (SELECT event_id FROM edge_history_recovery_message WHERE recovery_id=?)""",
             (job['id'], job['id'])).fetchone()
-        direction_pending = conn.execute("""SELECT count(*) FROM edge_inbound_events
+        direction_pending = conn.execute(f"""SELECT count(*) FROM edge_inbound_events e
             WHERE (json_extract(payload_json,'$.message.source.recovery_id')=?
                 OR client_event_id IN (SELECT event_id FROM edge_history_recovery_message WHERE recovery_id=?))
-            AND json_extract(payload_json,'$.message.direction')='unknown'""", (job['id'], job['id'])).fetchone()[0]
+            AND json_extract(payload_json,'$.message.direction')='unknown'
+            AND NOT ({system_notice})""", (job['id'], job['id'])).fetchone()[0]
         details = {}
         if include_details:
             # Local UI only. Never include message previews in telemetry or worker logs.
+            has_media_state = has_ledger and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_media_capture_state'").fetchone()
+            media_state = ("LEFT JOIN edge_message_ledger l ON e.dedupe_key=l.conversation_key||':'||l.event_hash "
+                           "LEFT JOIN edge_media_capture_state m ON m.event_hash=l.event_hash") if has_media_state else ''
+            media_errors = "coalesce(m.last_error,'') AS media_error, coalesce(m.paused_reason,'') AS media_paused_reason" if has_media_state else "'' AS media_error, '' AS media_paused_reason"
             tasks = conn.execute("""SELECT row_json,status,error_code,pages FROM edge_history_recovery_chat
                 WHERE recovery_id=? ORDER BY updated_at DESC, rowid DESC LIMIT 20""", (job['id'],)).fetchall()
-            messages = conn.execute("""SELECT payload_json,status,registered_direction FROM edge_inbound_events
+            messages = conn.execute(f"""SELECT payload_json,media_json,status,registered_direction,
+                {system_notice} AS system_notice, {media_errors} FROM edge_inbound_events e {media_state}
                 WHERE json_extract(payload_json,'$.message.source.recovery_id')=?
                 OR client_event_id IN (SELECT event_id FROM edge_history_recovery_message WHERE recovery_id=?)
-                ORDER BY id DESC LIMIT 20""", (job['id'], job['id'])).fetchall()
+                ORDER BY e.id DESC LIMIT 20""", (job['id'], job['id'])).fetchall()
             details['recent_chats'] = [{'title': str(json.loads(r['row_json']).get('title') or '')[:128],
                 'status': r['status'], 'error_code': r['error_code'], 'pages': r['pages']} for r in tasks]
             details['recent_messages'] = []
             for row in messages:
                 event = json.loads(row['payload_json'])
                 message = event.get('message') or {}
+                frames = [item for item in json.loads(row['media_json']) if item.get('capture_mode') == 'single_frame']
                 details['recent_messages'].append({
                     'title': str((event.get('conversation') or {}).get('title') or '')[:128],
                     'text': str(message.get('text') or ('[图片]' if message.get('media') else ''))[:160],
-                    'direction': message.get('direction') or 'unknown',
+                    'direction': 'system' if row['system_notice'] else message.get('direction') or 'unknown',
                     'observed_at': str(event.get('occurred_at') or ''),
                     'status': row['status'], 'registered': bool(row['registered_direction']) or row['status'] == 'delivered',
+                    'media_error': str(row['media_error'])[:96] if row['status'] == 'waiting_media' else '',
+                    'media_paused_reason': str(row['media_paused_reason'])[:96] if row['status'] == 'waiting_media' else '',
+                    'media_note': ('动态表情截图' if all(item.get('frame_kind') == 'animated-sticker' for item in frames)
+                                   else '图片单帧截图') if frames else '',
                 })
             details['discovery_error'] = job['discovery_error']
         return {k: job[k] for k in ('id','desired_mode','status','phase','conversation_label','error_code','updated_at')} | details | {

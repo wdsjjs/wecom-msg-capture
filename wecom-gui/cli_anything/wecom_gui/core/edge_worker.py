@@ -48,6 +48,7 @@ def _latest_customer_message(messages: list[dict]) -> dict | None:
 def _has_unsupported_media(message: dict) -> bool:
     return any(
         isinstance(item, dict) and str(item.get("type") or "image") != "image"
+        and not (message.get('recovery_frame_candidate') and str(item.get('type')) in {'animated_sticker', 'sticker', 'emoji'})
         for item in message.get("media") or []
     )
 
@@ -174,8 +175,13 @@ def _event_for_row(
     if ledger_entry is not None:
         message_id, message_hash = ledger_entry["event_id"], ledger_entry["event_hash"]
     media = _media_fingerprint(message.get("media") or [])
+    if message.get('recovery_frame_candidate') and not media:
+        media = [{"type": "image", "sha256": "", "capture_path": ""} for _ in message.get('media') or []]
     for index, item in enumerate(media):
         item["media_id"] = f"edge-media-{message_hash[:16]}-{index}"
+        source = (message.get('media') or [])[index]
+        if source.get('capture_mode') == 'single_frame':
+            item.update(capture_mode='single_frame', frame_kind=source.get('frame_kind') or 'message')
     payload = {
         "event_type": f"{direction}_message",
         "occurred_at": (datetime.fromtimestamp(ledger_entry["occurred_at"], timezone.utc)
@@ -190,7 +196,7 @@ def _event_for_row(
             "hash": message_hash,
             "direction": direction,
             "text": _message_text(message),
-            "media": [{key: value for key, value in item.items() if key != "capture_path"} for item in media],
+            "media": [_public_media(item) for item in media],
             "visible_chat_hash": str(current.get("hash") or ""),
             **({"source": {"stream_id": ledger_entry["stream_id"], "sequence": ledger_entry["sequence"],
                            "initial_snapshot": bool(ledger_entry.get("initial_snapshot", 1)),
@@ -199,6 +205,20 @@ def _event_for_row(
         },
     }
     return f"{conversation_key}:{message_hash}", payload, media
+
+
+def _public_media(item):
+    # Frame labels are local metadata; the filename carries the distinction over
+    # the existing upload contract without adding source/registration fields.
+    return {key: value for key, value in item.items() if key not in {'capture_path', 'capture_mode', 'frame_kind'}}
+
+
+def _discard_captured_media(media):
+    directory = macos_backend._image_capture_dir().resolve()
+    for item in media:
+        path = Path(str(item.get('capture_path') or '')).expanduser()
+        if path.is_file() and path.resolve().is_relative_to(directory):
+            path.unlink(missing_ok=True)
 
 
 def collect_inbound_once(*, inbox_limit: int = 30, last: int = 20, media_budget=None) -> dict:
@@ -373,7 +393,10 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
         if not fingerprint or (fingerprint.startswith("rgb32-v1:") and fresh_fingerprint.startswith("rgb32-v2:")):
             fingerprint = fresh_fingerprint
         if entry:
-            edge_message_ledger.verify_media_identity(entry, target, require_pixels=require_pixels)
+            # A hidden recovery row needs revealing before its old pixels can be checked.
+            if not snapshot_reader or fresh_fingerprint or require_pixels:
+                edge_message_ledger.verify_media_identity(entry, target, require_pixels=require_pixels,
+                    recovery_page_verified=bool(snapshot_reader))
         return messages
 
     def visible(item):
@@ -402,6 +425,8 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
             raise MediaCapturePending("media_not_visible")
     if not fingerprint or not (messages[index].get("direction_evidence") or {}).get("imageFingerprint"):
         raise MediaCapturePending("media_fingerprint_unavailable")
+    if entry and snapshot_reader:
+        edge_message_ledger.verify_media_identity(entry, messages[index], require_pixels=True, recovery_page_verified=True)
     # A transient preview failure must stay retryable, not become a sticker.
     captured = macos_backend.capture_chat_images(
         [{**messages[index], "media": missing}], cache_preview_failures=False,
@@ -420,10 +445,7 @@ def _capture_snapshot_image(row, candidates, index, missing_indices, *, entry=No
                 macos_backend._capture_sleep(0.2)
     except Exception:
         # Files obtained while the target changed must never enter the upload spool.
-        for item in captured:
-            path = Path(str(item.get("capture_path") or "")).expanduser()
-            if path.is_file() and path.resolve().is_relative_to(macos_backend._image_capture_dir().resolve()):
-                path.unlink(missing_ok=True)
+        _discard_captured_media(captured)
         raise
     return {"media": captured, "direction_evidence": messages[index].get("direction_evidence") or {}}
 
@@ -454,9 +476,26 @@ def _prepare_snapshot_media(row, candidates, index, entry, existing, budget, *, 
         budget.attempted_events.add(entry["event_hash"])
         try:
             with budget.capture(len(selected)):
-                edge_message_ledger.verify_media_identity(entry, message)
-                capture = _capture_snapshot_image(row, candidates, index, selected, entry=entry,
-                    **({'snapshot_reader': snapshot_reader} if snapshot_reader else {}))
+                frame_capture = getattr(snapshot_reader, 'capture_frame', None)
+                can_frame = callable(frame_capture) and len(media) == 1 and selected == [0]
+                if can_frame and message.get('recovery_frame_candidate'):
+                    capture = frame_capture(message['capture_row_id'])
+                else:
+                    try:
+                        if not snapshot_reader:
+                            edge_message_ledger.verify_media_identity(entry, message)
+                        capture = _capture_snapshot_image(row, candidates, index, selected, entry=entry,
+                            **({'snapshot_reader': snapshot_reader} if snapshot_reader else {}))
+                    except (MediaCapturePending, edge_message_ledger.MediaIdentityError) as exc:
+                        if not can_frame or str(exc) != 'media_fingerprint_changed':
+                            raise
+                        # This is explicitly an observed frame, not an original
+                        # attachment repair. Retain the old pinned image evidence.
+                        capture = frame_capture(message['capture_row_id'])
+                    if can_frame and any(item.get('error') in {'preview_image_not_found', 'preview_not_found'}
+                                         for item in capture['media']):
+                        _discard_captured_media(capture['media'])
+                        capture = frame_capture(message['capture_row_id'])
             captured = capture["media"]
             direction_evidence = capture["direction_evidence"]
             if len(captured) != len(selected):
@@ -506,6 +545,15 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
         if reason == "message_alignment_pending":
             return {"ok": False, "captured": 0, "reason": reason, "pending_alignment": 1}
         for entry, (_, message, _) in zip(entries, candidates):
+            if recovery_id and entry['capture_status'] == 'ignored' and message.get('recovery_frame_candidate'):
+                registered = conn.execute('SELECT 1 FROM edge_inbound_events WHERE dedupe_key=?',
+                    (f'{conversation_key}:{entry["event_hash"]}',)).fetchone()
+                if not registered:
+                    conn.execute('UPDATE edge_message_ledger SET recovery_id=? WHERE conversation_key=? AND sequence=?',
+                        (recovery_id, conversation_key, entry['sequence']))
+                    entry['recovery_id'] = recovery_id
+                edge_message_ledger.mark(conn, entry, status='pending_media', direction=entry['direction'])
+                entry['capture_status'] = 'pending_media'
             if message.get("media") and entry["capture_status"] not in {"baseline", "ignored", "captured"}:
                 edge_message_ledger.remember_media_identity(conn, entry, message)
     prepared = []
@@ -535,6 +583,10 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
             if not confidence and role in {"用户", "客服"}:
                 confidence = "high"
             evidence = message.get("direction_evidence") or {}
+            if role == '系统' and evidence.get('source') == 'screencapturekit' and evidence.get('status') == 'system_notice':
+                # Preserve the ledger position and any existing registration contract.
+                edge_message_ledger.mark(conn, entry, status='ignored', direction='system')
+                continue
             if role != "用户" and evidence.get("side") != "left" and edge_state.is_command_echo_row(
                     conversation_key, str(message.get("capture_row_id") or ""),
                     _snapshot_match_key(message), connection=conn):
@@ -599,7 +651,7 @@ def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, 
                 payload["message"]["direction"] = "inbound" if evidence["side"] == "left" else "outbound"
                 payload["event_type"] = payload["message"]["direction"] + "_message"
                 pending_direction = max(0, pending_direction - 1)
-            payload["message"]["media"] = [{k: v for k, v in item.items() if k != "capture_path"} for item in media]
+            payload["message"]["media"] = [_public_media(item) for item in media]
             _, event = edge_state.enqueue_inbound(dedupe_key=key, payload=payload, media=media, connection=conn)
             direction = event["payload"]["message"]["direction"]
             edge_message_ledger.mark(conn, entry, direction=direction,

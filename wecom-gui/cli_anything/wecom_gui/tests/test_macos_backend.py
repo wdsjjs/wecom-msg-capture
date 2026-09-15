@@ -1077,6 +1077,25 @@ def test_swift_ax_scan_commands_keep_sidebar_timeout_short(monkeypatch):
 
     assert captured["timeout"] == 2.0
 
+
+def test_recovery_timeout_is_bounded_and_does_not_extend_live_reads(monkeypatch):
+    monkeypatch.delenv('WECOM_GUI_AX_TIMEOUT', raising=False)
+    monkeypatch.delenv('WECOM_GUI_AX_RECOVERY_TIMEOUT', raising=False)
+    monkeypatch.delenv('WECOM_GUI_AX_CHAT_TIMEOUT', raising=False)
+    monkeypatch.setattr(macos_backend.shutil, 'which', lambda command: '/usr/bin/swift')
+    monkeypatch.setattr(macos_backend, '_swift_ax_runner', lambda path: ['fixture-helper'])
+    timeouts = []
+    def run(args, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+    monkeypatch.setattr(macos_backend.subprocess, 'run', run)
+    for command in ['recovery-chat-page', 'recovery-chat-reveal', 'recovery-inbox-page', 'chat']:
+        macos_backend._swift_ax(command)
+    assert timeouts == [20, 20, 20, 8]
+    with macos_backend.capture_deadline(macos_backend.time.monotonic() + 1):
+        macos_backend._swift_ax('recovery-chat-page')
+    assert 0 < timeouts[-1] <= 1
+
 def test_swift_ax_chat_and_geometry_use_longer_timeouts(monkeypatch):
     monkeypatch.delenv("WECOM_GUI_AX_TIMEOUT", raising=False)
     monkeypatch.delenv("WECOM_GUI_AX_CHAT_TIMEOUT", raising=False)

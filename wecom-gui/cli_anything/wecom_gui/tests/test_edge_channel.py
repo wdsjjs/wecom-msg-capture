@@ -5,6 +5,11 @@ import pytest
 from cli_anything.wecom_gui.core import edge_channel, edge_state, edge_worker, state
 
 
+@pytest.fixture(autouse=True)
+def isolated_channel_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+
+
 class FakeChannel:
     def __init__(self, *, inbound_error: Exception | None = None):
         self.inbound_error = inbound_error

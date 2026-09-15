@@ -74,14 +74,15 @@ def infer_roles(messages: list[dict]) -> list[dict]:
     for msg in messages:
         evidence = msg.get("direction_evidence")
         if evidence is not None:
+            system_notice = isinstance(evidence, dict) and evidence.get('source') == 'screencapturekit' and evidence.get('status') == 'system_notice'
             verified = (
                 isinstance(evidence, dict) and evidence.get("source") == "screencapturekit"
                 and evidence.get("status") == "matched" and evidence.get("side") in {"left", "right"}
             )
             enriched.append({
                 **msg,
-                "role": ("用户" if evidence["side"] == "left" else "客服") if verified else "unknown",
-                "role_confidence": "high" if verified else "low",
+                "role": "系统" if system_notice else ("用户" if evidence["side"] == "left" else "客服") if verified else "unknown",
+                "role_confidence": "high" if verified or system_notice else "low",
                 "content": msg.get("text", ""),
             })
             continue

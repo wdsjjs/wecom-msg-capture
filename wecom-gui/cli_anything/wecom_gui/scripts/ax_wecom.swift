@@ -126,12 +126,9 @@ func collectText(_ element: AXUIElement, maxDepth: Int = 8) -> [String] {
     return out
 }
 
-func windowLooksLikeImagePreview(_ window: AXUIElement) -> Bool {
-    var values = collectText(window, maxDepth: 6).map { $0.lowercased() }
-    if let title = stringAttr(window, kAXTitleAttribute as CFString) {
-        values.append(title.lowercased())
-    }
-    let hasImageTitle = values.contains { $0 == "图片" || $0 == "image" || $0.contains("图片") }
+func imagePreviewEvidence(_ values: [String], controlHelp: [String] = []) -> Bool {
+    let values = (values + controlHelp).map { $0.lowercased() }
+    let hasImageTitle = values.contains { $0 == "图片" || $0 == "image" }
     let hasPreviewControl = values.contains { value in
         value.contains("上一张")
             || value.contains("下一张")
@@ -142,6 +139,23 @@ func windowLooksLikeImagePreview(_ window: AXUIElement) -> Bool {
             || value.contains("翻译")
     }
     return hasImageTitle && hasPreviewControl
+}
+
+func windowLooksLikeImagePreview(_ window: AXUIElement) -> Bool {
+    var values: [String] = []
+    var help: [String] = []
+    var visited = 0
+    func walk(_ node: AXUIElement, depth: Int) {
+        guard depth <= 6, visited < 256 else { return }
+        visited += 1
+        // The main chat and sidebar cannot supply evidence for a preview window.
+        guard !["AXTable", "AXWebArea", "AXTextArea"].contains(role(node)) else { return }
+        values.append(contentsOf: textValues(node))
+        if let label = stringAttr(node, kAXHelpAttribute as CFString) { help.append(label) }
+        for child in children(node) { walk(child, depth: depth + 1) }
+    }
+    walk(window, depth: 0)
+    return imagePreviewEvidence(values, controlHelp: help)
 }
 
 func previewContentFallbackRect(_ window: AXUIElement) -> [String: Any]? {
@@ -169,22 +183,6 @@ func previewContentFallbackRect(_ window: AXUIElement) -> [String: Any]? {
         "width": max(1.0, width - sideInset * 2),
         "height": max(1.0, height - topInset - bottomInset)
     ]
-}
-
-func windowLooksLikeDetachedPreview(_ window: AXUIElement) -> Bool {
-    guard let rect = rectPayload(window) else {
-        return false
-    }
-    let width = rect["width", default: 0]
-    let height = rect["height", default: 0]
-    if width < 320 || width > 900 || height < 240 || height > 900 {
-        return false
-    }
-    if height < 80 || width / max(height, 1) > 4.0 {
-        return false
-    }
-    let title = (stringAttr(window, kAXTitleAttribute as CFString) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    return title.isEmpty || title == "图片" || title.lowercased() == "image"
 }
 
 func collectRows(_ element: AXUIElement, rows: inout [AXUIElement], maxDepth: Int = 12, depth: Int = 0) {
@@ -382,7 +380,8 @@ func collectTextElements(_ element: AXUIElement, out: inout [[String: Any]], max
     }
 }
 
-func mediaPayload(elementRole: String, elementSubrole: String, values: [String], rect: [String: Double]) -> [String: Any]? {
+func mediaPayload(elementRole: String, elementSubrole: String, values: [String], rect: [String: Double],
+                  maximumDimension: Double = 640) -> [String: Any]? {
     let width = rect["width", default: 0]
     let height = rect["height", default: 0]
     let loweredValues = values.map { $0.lowercased() }
@@ -407,8 +406,8 @@ func mediaPayload(elementRole: String, elementSubrole: String, values: [String],
     if roleLooksLikeMedia
         && width >= 32
         && height >= 32
-        && width <= 640
-        && height <= 640 {
+        && width <= maximumDimension
+        && height <= maximumDimension {
         let mediaType = looksLikeAnimatedMedia ? "animated_sticker" : "image"
         return [
             "role": elementRole,
@@ -425,7 +424,8 @@ func mediaPayload(elementRole: String, elementSubrole: String, values: [String],
     return nil
 }
 
-func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], maxDepth: Int = 10, depth: Int = 0) {
+func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], maxDepth: Int = 10,
+                          depth: Int = 0, maximumDimension: Double = 640) {
     if depth > maxDepth {
         return
     }
@@ -433,11 +433,12 @@ func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], ma
     let elementSubrole = subrole(element)
     let values = textValues(element).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     if let rect = rectPayload(element),
-       let media = mediaPayload(elementRole: elementRole, elementSubrole: elementSubrole, values: values, rect: rect) {
+       let media = mediaPayload(elementRole: elementRole, elementSubrole: elementSubrole, values: values,
+                                rect: rect, maximumDimension: maximumDimension) {
         out.append(media)
     }
     for child in children(element) {
-        collectMediaElements(child, out: &out, maxDepth: maxDepth, depth: depth + 1)
+        collectMediaElements(child, out: &out, maxDepth: maxDepth, depth: depth + 1, maximumDimension: maximumDimension)
     }
 }
 
@@ -542,8 +543,8 @@ func chatPayload(_ nodes: [ChatNodeSnapshot], index: Int, viewport: [String: Dou
     payload["bubbleTextSupported"] = messageElements.count == 1 && mediaElements.isEmpty
     let bodyTexts = messageElements.flatMap { $0["texts"] as? [String] ?? [] }
     payload["bubbleImageSupported"] = row.height >= 64
-        && bodyTexts.allSatisfy { ["[图片]", "图片", "[image]"].contains($0) }
-        && mediaElements.allSatisfy { $0["mediaType"] as? String == "image" }
+        && bodyTexts.allSatisfy { ["[图片]", "图片", "[image]", "[动画表情]", "动画表情", "[表情]"].contains($0) }
+        && mediaElements.allSatisfy { ["image", "animated_sticker"].contains($0["mediaType"] as? String ?? "") }
     payload["timestampText"] = textElements.filter { $0["role"] as? String == "AXStaticText" }
         .flatMap { $0["texts"] as? [String] ?? [] }.first(where: isLikelyTimeText) ?? ""
     if let viewport = viewport {
@@ -797,6 +798,34 @@ func bubbleEvidence(body: CGRect, viewport: CGRect, boxes: [CGRect]) -> [String:
     return result
 }
 
+func isSystemNotice(_ item: [String: Any], viewport: CGRect) -> Bool {
+    let texts = item["messageTexts"] as? [String] ?? []
+    guard texts.count == 1 else { return false }
+    let text = texts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+    let body = bodyRect(item)
+    return text.hasPrefix("你已添加了") && text.hasSuffix("，现在可以开始聊天了。")
+        && body.width > 0 && body.height > 0 && viewport.contains(body)
+        && abs(body.midX - viewport.midX) <= 4
+}
+
+@available(macOS 14.0, *)
+func directionCaptureConfiguration(window: CGRect, content: CGRect) -> SCStreamConfiguration? {
+    guard window.width > 0, window.height > 0,
+          abs(content.width - window.width) < 2, abs(content.height - window.height) < 2 else { return nil }
+    let config = SCStreamConfiguration()
+    config.width = Int(window.width.rounded())
+    config.height = Int(window.height.rounded())
+    config.showsCursor = false
+    config.ignoreShadowsSingleWindow = true
+    // Fullscreen capture can include the menu strip unless the content is cropped explicitly.
+    config.sourceRect = content
+    config.destinationRect = CGRect(x: 0, y: 0, width: config.width, height: config.height)
+    config.scalesToFit = true
+    config.preservesAspectRatio = false
+    config.ignoreGlobalClipSingleWindow = true
+    return config
+}
+
 final class CaptureResult<Value> {
     private let lock = NSLock()
     private var value: Value?
@@ -849,7 +878,8 @@ func chatWindowIndices(rowCount: Int, last: Int) -> Range<Int> {
 
 func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, window: AXUIElement?,
                             table: AXUIElement?, selected: AXUIElement?, last: Int,
-                            cursor: [String: Any]? = nil) -> [[String: Any]] {
+                            cursor: [String: Any]? = nil,
+                            onVerifiedImage: (([[String: Any]], CGImage, CGRect) -> Void)? = nil) -> [[String: Any]] {
     func unverified(_ reason: String) -> [[String: Any]] {
         return payloads.map { item in
             var result = item
@@ -889,19 +919,30 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     guard matching.count == 1, let target = matching.first else { return unverified("window_unavailable_or_ambiguous") }
     guard target.isOnScreen else { return unverified("window_not_on_screen") }
     let filter = SCContentFilter(desktopIndependentWindow: target)
-    let config = SCStreamConfiguration()
-    config.width = Int(windowRect.width.rounded())
-    config.height = Int(windowRect.height.rounded())
-    config.showsCursor = false
-    config.ignoreShadowsSingleWindow = true
+    guard let config = directionCaptureConfiguration(window: windowRect, content: filter.contentRect) else {
+        return unverified("capture_geometry_unverified")
+    }
+    if profileChatRead {
+        fputs("ax-profile capture_request: ax=\(windowRect) sck=\(target.frame) content=\(filter.contentRect)\n", stderr)
+    }
     let imageResult = CaptureResult<Result<CGImage, Error>>()
     SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
         if let image = image { imageResult.set(.success(image)) }
         else { imageResult.set(.failure(error ?? NSError(domain: "ScreenCaptureKit", code: -1))) }
     }
-    guard let captured = measured("capture_window", { waitForCapture(imageResult, until: deadline) }),
-          case .success(let image) = captured else {
+    guard let captured = measured("capture_window", { waitForCapture(imageResult, until: deadline) }) else {
         return unverified("capture_failed_or_timed_out")
+    }
+    guard case .success(let image) = captured else {
+        if profileChatRead, case .failure(let error) = captured {
+            let failure = error as NSError
+            fputs("ax-profile capture_error: domain=\(failure.domain) code=\(failure.code)\n", stderr)
+        }
+        return unverified("capture_failed_or_timed_out")
+    }
+    if profileChatRead {
+        fputs("ax-profile capture_geometry: ax=\(windowRect) sck=\(target.frame) content=\(filter.contentRect) "
+            + "scale=\(filter.pointPixelScale) pixels=\(image.width)x\(image.height)\n", stderr)
     }
     let afterPayloads: [[String: Any]]
     if let cursor = cursor {
@@ -943,8 +984,38 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
         }
         return unverified("chat_changed_during_capture")
     }
-    return applyBubbleDirections(cursor == nil ? payloads : afterPayloads, image: image,
-                                 windowRect: windowRect, windowID: target.windowID)
+    let verified = applyBubbleDirections(cursor == nil ? payloads : afterPayloads, image: image,
+                                        windowRect: windowRect, windowID: target.windowID)
+    onVerifiedImage?(verified, image, windowRect)
+    return verified
+}
+
+func recoveryFrame(_ rows: [[String: Any]], rowID: String, image: CGImage,
+                   window: CGRect, output: String) -> [String: Any] {
+    let matches = rows.filter { $0["captureRowId"] as? String == rowID }
+    guard matches.count == 1, let row = matches.first, row["bubbleImageSupported"] as? Bool == true,
+          let evidence = row["directionEvidence"] as? [String: Any],
+          evidence["status"] as? String == "matched",
+          let fingerprint = evidence["imageFingerprint"] as? String, !fingerprint.isEmpty,
+          let rect = evidence["bubbleRect"] as? [String: Double],
+          let viewport = row["chatViewport"] as? [String: Double],
+          window.contains(cgRect(rect)), cgRect(viewport).contains(cgRect(rect)) else {
+        return ["ok": false, "reason": "frame_image_unverified"]
+    }
+    let frameRect = cgRect(rect)
+    let crop = CGRect(x: (frameRect.minX - window.minX) * Double(image.width) / window.width,
+                      y: (frameRect.minY - window.minY) * Double(image.height) / window.height,
+                      width: frameRect.width * Double(image.width) / window.width,
+                      height: frameRect.height * Double(image.height) / window.height)
+    guard let cropped = image.cropping(to: crop),
+          let png = NSBitmapImageRep(cgImage: cropped).representation(using: .png, properties: [:]) else {
+        return ["ok": false, "reason": "frame_encode_failed"]
+    }
+    do {
+        try png.write(to: URL(fileURLWithPath: output), options: Data.WritingOptions.withoutOverwriting)
+        return ["ok": true, "path": output, "capture_row_id": rowID,
+                "rect": rectDictionary(frameRect), "direction_evidence": evidence]
+    } catch { return ["ok": false, "reason": "frame_write_failed"] }
 }
 
 func applyBubbleDirections(_ payloads: [[String: Any]], image: CGImage,
@@ -982,6 +1053,9 @@ func applyBubbleDirections(_ payloads: [[String: Any]], image: CGImage,
             }
         } else {
             evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
+            if evidence["status"] as? String == "no_matching_bubble", isSystemNotice(item, viewport: viewport) {
+                evidence["status"] = "system_notice"
+            }
         }
         evidence["windowId"] = windowID
         result["directionEvidence"] = evidence
@@ -1002,36 +1076,6 @@ func allWindows(_ app: AXUIElement) -> [AXUIElement] {
         windows.append(contentsOf: axWindows)
     }
     return windows
-}
-
-func candidatePreviewWindow(_ windows: [AXUIElement]) -> AXUIElement? {
-    var bestWindow: AXUIElement?
-    var bestArea = 0.0
-    let screenRect = NSScreen.main?.frame ?? .zero
-    for window in windows {
-        guard let rect = rectPayload(window) else {
-            continue
-        }
-        let x = rect["x", default: 0]
-        let y = rect["y", default: 0]
-        let width = rect["width", default: 0]
-        let height = rect["height", default: 0]
-        let area = width * height
-        if width < 180 || height < 160 || area < 30000 {
-            continue
-        }
-        if width > Double(screenRect.width) * 0.98 || height > Double(screenRect.height) * 0.98 {
-            continue
-        }
-        if x < -20 || y < -20 {
-            continue
-        }
-        if area > bestArea {
-            bestArea = area
-            bestWindow = window
-        }
-    }
-    return bestWindow
 }
 
 func doubleClickAt(x: Double, y: Double) {
@@ -1160,66 +1204,45 @@ func submitInput(root: AXUIElement, window: AXUIElement?, input: AXUIElement, te
     ]
 }
 
+func previewImageBounds(_ media: [String: Any], window: [String: Double]) -> [String: Any]? {
+    guard ["AXImage", "AXImageView"].contains(media["role"] as? String ?? "") else { return nil }
+    var rect: [String: Double] = [:]
+    for key in ["x", "y", "width", "height"] {
+        guard let value = media[key] as? Double, value.isFinite else { return nil }
+        rect[key] = value
+    }
+    let bounds = cgRect(rect).intersection(cgRect(window))
+    guard !bounds.isNull, bounds.width >= 32, bounds.height >= 32 else { return nil }
+    return media.merging(rectDictionary(bounds)) { _, new in new }
+}
+
 func previewPayload(root: AXUIElement) -> [String: Any] {
     let windows = allWindows(root)
-    var bestWindow: AXUIElement?
-    var bestMedia: [String: Any]?
-    var bestArea = 0.0
-    let minArea = 40000.0
-    for window in windows {
-        var media: [[String: Any]] = []
-        collectMediaElements(window, out: &media, maxDepth: 12)
-        for item in media {
-            let width = item["width"] as? Double ?? 0
-            let height = item["height"] as? Double ?? 0
-            let area = width * height
-            if area > bestArea {
-                bestArea = area
-                bestWindow = window
-                bestMedia = item
-            }
-        }
+    guard let window = windows.first(where: windowLooksLikeImagePreview) else {
+        return ["ok": false, "error": "preview_image_not_found", "windowCount": windows.count]
     }
-    for window in windows {
-        if windowLooksLikeImagePreview(window), let fallback = previewContentFallbackRect(window) {
-            return [
-                "ok": true,
-                "window": rectPayload(window) ?? [:],
-                "image": fallback,
-                "windowCount": windows.count,
-                "fallback": "window-content"
-            ]
-        }
+    let windowRect = rectPayload(window) ?? [:]
+    var media: [[String: Any]] = []
+    collectMediaElements(window, out: &media, maxDepth: 6, maximumDimension: .greatestFiniteMagnitude)
+    func area(_ item: [String: Any]) -> Double {
+        let width = item["width"] as? Double ?? 0
+        let height = item["height"] as? Double ?? 0
+        return width * height
     }
-    for window in windows {
-        if windowLooksLikeDetachedPreview(window), let fallback = previewContentFallbackRect(window) {
-            return [
-                "ok": true,
-                "window": rectPayload(window) ?? [:],
-                "image": fallback,
-                "windowCount": windows.count,
-                "fallback": "window-content"
-            ]
-        }
+    let images = media.compactMap { previewImageBounds($0, window: windowRect) }
+    if let image = images.max(by: { area($0) < area($1) }) {
+        return ["ok": true, "window": rectPayload(window) ?? [:], "image": image, "windowCount": windows.count]
     }
-    if let window = candidatePreviewWindow(windows), let fallback = previewContentFallbackRect(window) {
+    if let fallback = previewContentFallbackRect(window) {
         return [
             "ok": true,
             "window": rectPayload(window) ?? [:],
             "image": fallback,
             "windowCount": windows.count,
-            "fallback": "candidate-window"
+            "fallback": "window-content"
         ]
     }
-    guard let window = bestWindow, let media = bestMedia, bestArea >= minArea else {
-        return ["ok": false, "error": "preview_image_not_found", "windowCount": windows.count]
-    }
-    return [
-        "ok": true,
-        "window": rectPayload(window) ?? [:],
-        "image": media,
-        "windowCount": windows.count
-    ]
+    return ["ok": false, "error": "preview_image_not_found", "windowCount": windows.count]
 }
 
 func closePreview(root: AXUIElement) -> [String: Any] {
@@ -1237,25 +1260,7 @@ func closePreview(root: AXUIElement) -> [String: Any] {
         }
     }
     let windows = allWindows(root)
-    var bestWindow: AXUIElement?
-    var bestArea = 0.0
-    var previewWindow: AXUIElement?
-    for window in windows {
-        if previewWindow == nil && (windowLooksLikeImagePreview(window) || windowLooksLikeDetachedPreview(window)) {
-            previewWindow = window
-        }
-        var media: [[String: Any]] = []
-        collectMediaElements(window, out: &media, maxDepth: 12)
-        let windowArea = media.map {
-            (($0["width"] as? Double) ?? 0) * (($0["height"] as? Double) ?? 0)
-        }.max() ?? 0
-        if windowArea > bestArea {
-            bestArea = windowArea
-            bestWindow = window
-        }
-    }
-    let targetWindow = previewWindow ?? candidatePreviewWindow(windows) ?? (bestArea >= 40000.0 ? bestWindow : nil)
-    guard let targetWindow = targetWindow else {
+    guard let targetWindow = windows.first(where: windowLooksLikeImagePreview) else {
         return ["ok": false, "error": "preview_window_not_found", "windowCount": windows.count]
     }
     for window in [targetWindow] {
@@ -2298,13 +2303,13 @@ func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapsho
     guard ids.allSatisfy({ !$0.isEmpty }), Set(ids).count == ids.count else { throw RecoveryError(reason: "ax_row_identity_unverified") }
     let tableID = captureRowIdentity(table), windowID = captureRowIdentity(window)
     guard !tableID.isEmpty, !windowID.isEmpty else { throw RecoveryError(reason: "ax_scope_identity_unverified") }
+    let rowRects = rows.map { rectPayload($0).map(cgRect) }
     let visible = rows.indices.filter { index in
-        guard let rect = rectPayload(rows[index]) else { return false }
-        let bounds = cgRect(rect)
+        guard let bounds = rowRects[index] else { return false }
         return bounds.width > 0 && bounds.height > 0 && cgRect(viewport).intersects(bounds)
     }
     let boundary = recoveryBoundaries(viewport: cgRect(viewport),
-        rowRects: rows.map { rectPayload($0).map(cgRect) },
+        rowRects: rowRects,
         reportedCount: recoveryNumber(table, kAXRowCountAttribute as CFString),
         scrollbar: recoveryScrollbar(area).flatMap(recoveryScrollbarState))
     return RecoverySnapshot(scope: ["kind": kind, "table_id": tableID, "window_id": windowID,
@@ -2318,8 +2323,8 @@ func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapsho
                 return payload
             }
         }, topVerified: boundary.top, fullyVisible: rows.indices.filter { index in
-            guard let rect = rectPayload(rows[index]) else { return false }
-            return cgRect(rect).height > 0 && cgRect(viewport).insetBy(dx: 0, dy: 4).contains(cgRect(rect))
+            guard let rect = rowRects[index] else { return false }
+            return rect.height > 0 && cgRect(viewport).contains(rect)
         }, table: table, scrollArea: area, rows: rows)
 }
 
@@ -2430,6 +2435,36 @@ func intArg(_ index: Int, defaultValue: Int) -> Int {
 
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : "rows"
+if command == "preview-evidence-fixture", args.count == 3 {
+    do {
+        guard let cases = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[2]))) as? [[String: Any]] else { exit(2) }
+        for item in cases {
+            if let rect = item["rect"] as? [String: Double], let window = item["window"] as? [String: Double] {
+                let media = mediaPayload(elementRole: item["role"] as? String ?? "AXImage", elementSubrole: "", values: [],
+                    rect: rect, maximumDimension: .greatestFiniteMagnitude)
+                jsonLine(media.flatMap { previewImageBounds($0, window: window) } ?? [:])
+            } else {
+                jsonLine(["ok": imagePreviewEvidence(item["values"] as? [String] ?? [], controlHelp: item["help"] as? [String] ?? [])])
+            }
+        }
+        exit(0)
+    } catch { fputs("Invalid preview evidence fixture\n", stderr); exit(2) }
+}
+if command == "capture-config-fixture", args.count == 3 {
+    do {
+        guard #available(macOS 14.0, *),
+              let cases = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[2]))) as? [[String: [String: Double]]] else { exit(2) }
+        for item in cases {
+            guard let config = directionCaptureConfiguration(window: cgRect(item["window"] ?? [:]), content: cgRect(item["content"] ?? [:])) else {
+                jsonLine(["ok": false]); continue
+            }
+            jsonLine(["ok": true, "source": rectDictionary(config.sourceRect), "destination": rectDictionary(config.destinationRect),
+                      "width": config.width, "height": config.height, "scalesToFit": config.scalesToFit,
+                      "preservesAspectRatio": config.preservesAspectRatio])
+        }
+        exit(0)
+    } catch { fputs("Invalid capture configuration fixture\n", stderr); exit(2) }
+}
 if command == "single-chat-fixture", args.count == 3 {
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
@@ -2505,6 +2540,7 @@ if command == "recovery-fixture", args.count == 3 {
             ? recoveryReveal(row: fixture["row"] as? Int ?? 0, cursor: cursor, size: size, read: read, move: move)
             : recoveryPage(kind: kind, action: fixture["action"] as? String ?? "latest",
                            size: size, cursor: cursor, read: read, move: move)
+        var exportedFrame: [String: Any]?
         if let imagePath = fixture["imagePath"] as? String,
            let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
            let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
@@ -2512,7 +2548,11 @@ if command == "recovery-fixture", args.count == 3 {
             result = recoveryChatDirections(result, read: read, verify: { rows, cursor, size in
                 do {
                     let after = try recoveryCaptureRows(cursor: cursor, before: rows, snapshot: read(), size: size)
-                    return applyBubbleDirections(after, image: image, windowRect: cgRect(rect), windowID: 1)
+                    let verified = applyBubbleDirections(after, image: image, windowRect: cgRect(rect), windowID: 1)
+                    if let output = fixture["frameOutput"] as? String, let rowID = fixture["frameRowID"] as? String {
+                        exportedFrame = recoveryFrame(verified, rowID: rowID, image: image, window: cgRect(rect), output: output)
+                    }
+                    return verified
                 } catch {
                     return rows.map { row in
                         var payload = row
@@ -2522,6 +2562,10 @@ if command == "recovery-fixture", args.count == 3 {
                     }
                 }
             })
+        }
+        if let frame = exportedFrame {
+            if result["ok"] as? Bool == true { result["frame"] = frame }
+            else if let path = frame["path"] as? String { try? FileManager.default.removeItem(atPath: path) }
         }
         result["fixture_scrolls"] = scrolls
         result["fixture_reads"] = reads
@@ -2607,7 +2651,7 @@ guard let root = appElement(bundleID: bundleID) else {
 
 let window = measured("main_window") { mainWindow(root) }
 
-if command == "recovery-chat-page" || command == "recovery-inbox-page" || command == "recovery-chat-reveal" {
+if command == "recovery-chat-page" || command == "recovery-inbox-page" || command == "recovery-chat-reveal" || command == "recovery-chat-frame" {
     let kind = command == "recovery-inbox-page" ? "inbox" : "chat"
     let action = args.count > 2 ? args[2] : (kind == "chat" ? "latest" : "current")
     var cursor: [String: Any]?
@@ -2627,13 +2671,37 @@ if command == "recovery-chat-page" || command == "recovery-inbox-page" || comman
             settle: { Thread.sleep(forTimeInterval: 0.15) }))
         exit(0)
     }
-    var page = recoveryPage(kind: kind, action: action, size: size, cursor: cursor,
+    let frameRequested = command == "recovery-chat-frame"
+    var frame: [String: Any] = ["ok": false, "reason": "frame_capture_unavailable"]
+    var frameRowID = ""
+    if frameRequested {
+        guard args.count == 6, let cursor = cursor, let offset = cursor["row_offset"] as? Int,
+              let anchors = cursor["anchors"] as? [[String: String]],
+              anchors.indices.contains(intArg(2, defaultValue: 0) - 1 - offset) else {
+            jsonLine(["ok": false, "reason": "row_outside_cursor"]); exit(0)
+        }
+        frameRowID = anchors[intArg(2, defaultValue: 0) - 1 - offset]["id"] ?? ""
+    }
+    var page = recoveryPage(kind: kind, action: frameRequested ? "current" : action, size: size, cursor: cursor,
         read: { try recoverySnapshot(root: root, kind: kind) }, move: recoveryMove,
         settle: { Thread.sleep(forTimeInterval: 0.15) })
     if kind == "chat" {
         page = recoveryChatDirections(page, read: { try recoverySnapshot(root: root, kind: "chat") }, verify: { rows, cursor, size in
-            verifyBubbleDirections(rows, root: root, window: mainWindow(root), table: nil, selected: nil, last: size, cursor: cursor)
+            verifyBubbleDirections(rows, root: root, window: mainWindow(root), table: nil, selected: nil, last: size, cursor: cursor,
+                onVerifiedImage: { verified, image, window in
+                    if frameRequested { frame = recoveryFrame(verified, rowID: frameRowID, image: image, window: window, output: args[5]) }
+                })
         })
+    }
+    if frameRequested {
+        if page["ok"] as? Bool != true {
+            if let path = frame["path"] as? String { try? FileManager.default.removeItem(atPath: path) }
+            jsonLine(["ok": false, "reason": page["reason"] ?? "frame_page_changed"])
+        } else {
+            frame["cursor"] = page["cursor"]
+            jsonLine(frame)
+        }
+        exit(0)
     }
     jsonLine(page)
 } else if command == "rows" {

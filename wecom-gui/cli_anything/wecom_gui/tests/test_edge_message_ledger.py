@@ -1078,6 +1078,25 @@ def test_restarted_wecom_can_only_rebind_an_image_with_pinned_pixels(capture, mo
         assert edge_message_ledger.media_state(entry)["capture_row_id"] == original["capture_row_id"]
 
 
+@pytest.mark.parametrize('verified,matching', [(True, True), (False, True), (True, False)])
+def test_reopened_history_rebinds_rows_only_with_verified_page_and_exact_pixels(capture, verified, matching):
+    capture([])
+    original = image_message()
+    capture([original], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    before = all_events()[0]['payload']
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute('SELECT * FROM edge_message_ledger').fetchone())
+    reopened = image_message(row_id='7551:1000:reopened-row', fingerprint='rgb32-v1:image-1' if matching else 'rgb32-v1:other')
+    if verified and matching:
+        edge_message_ledger.verify_media_identity(entry, reopened, require_pixels=True, recovery_page_verified=verified)
+        assert edge_message_ledger.media_state(entry)['capture_row_id'] == reopened['capture_row_id']
+    else:
+        with pytest.raises(edge_message_ledger.MediaIdentityError):
+            edge_message_ledger.verify_media_identity(entry, reopened, require_pixels=True, recovery_page_verified=verified)
+        assert edge_message_ledger.media_state(entry)['capture_row_id'] == original['capture_row_id']
+    assert all_events()[0]['payload'] == before
+
+
 def test_tick_keeps_command_polling_after_shared_image_budget_exhaustion(capture, grab_images, monkeypatch):
     capture([])
     snapshot = [image_message(), message("anchor"), image_message(row_id="7551:1000:row-2"),
