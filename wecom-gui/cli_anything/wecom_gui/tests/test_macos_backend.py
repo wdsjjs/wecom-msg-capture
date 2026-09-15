@@ -505,14 +505,16 @@ def test_selected_conversation_row_prefers_swift_selected_row(monkeypatch):
     assert row["title"] == "客户A"
     assert row["selected"] is True
     assert row["source"] == "axuielement-selected"
-    assert commands == ["rows", "selected-row"]
+    assert commands == ["selected-row"]
 
 
-def test_selected_conversation_row_uses_selected_flag_from_row_scan_before_fallback(monkeypatch):
+def test_selected_conversation_row_uses_row_scan_when_selected_attribute_unavailable(monkeypatch):
     commands = []
 
     def fake_swift(command):
         commands.append(command)
+        if command == "selected-row":
+            return [{"ok": False, "error": "selected_conversation_not_found"}]
         if command == "rows":
             return [{
                 "texts": ["客户A", "刚刚", "查订单", "@微信"],
@@ -522,7 +524,7 @@ def test_selected_conversation_row_uses_selected_flag_from_row_scan_before_fallb
                 "height": 64,
                 "selected": True,
             }]
-        raise AssertionError("selected-row should not run when the row scan is selected")
+        raise AssertionError("No broad fallback needed once a selected row is found")
 
     monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
     monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
@@ -531,7 +533,24 @@ def test_selected_conversation_row_uses_selected_flag_from_row_scan_before_fallb
 
     assert row["title"] == "客户A"
     assert row["selected"] is True
-    assert commands == ["rows"]
+    assert commands == ["selected-row", "rows"]
+
+
+def test_selected_row_still_reads_when_background_scan_circuit_is_open(monkeypatch):
+    calls = []
+    monkeypatch.setattr(macos_backend, '_AX_SCAN_DISABLED_UNTIL', float('inf'))
+    monkeypatch.setattr(macos_backend, '_swift_ax_runner', lambda path: ['fixture-helper'])
+    monkeypatch.setattr(macos_backend.shutil, 'which', lambda name: name)
+
+    def run(args, **kwargs):
+        calls.append(args[-1])
+        assert kwargs['timeout'] == 2
+        return subprocess.CompletedProcess(args, 0, '{"selected":true,"texts":["fixture-customer"]}\n', '')
+
+    monkeypatch.setattr(macos_backend.subprocess, 'run', run)
+    assert macos_backend._swift_ax('rows')[0]['error'] == 'swift_ax_scan_circuit_open'
+    assert macos_backend._swift_ax('selected-row')[0]['selected'] is True
+    assert calls == ['selected-row']
 
 
 def test_ax_chat_messages_accepts_chat_pane_on_sidebar_boundary(monkeypatch):

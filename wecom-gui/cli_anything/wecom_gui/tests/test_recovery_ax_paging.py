@@ -71,6 +71,44 @@ def ids(page):
     return [row["captureRowId"] for row in page["rows"]]
 
 
+def test_table_lookup_skips_chat_rows_and_sidebar_web_content(native_helper, tmp_path):
+    table = {"id": "inbox", "role": "AXTable", "children": [
+        {"id": f"message-{i}", "role": "AXRow"} for i in range(3000)
+    ]}
+    tree = {"id": "window", "role": "AXWindow", "children": [
+        {"id": "split", "role": "AXSplitGroup", "children": [table,
+            {"id": "chat", "role": "AXTable", "children": table["children"]}]},
+        {"id": "sidebar", "role": "AXWebArea", "children": [
+            {"id": "unrelated-web-table", "role": "AXTable"}]},
+    ]}
+    fixture = tmp_path / 'tree.json'
+    fixture.write_text(json.dumps(tree))
+    proc = subprocess.run([str(native_helper), 'table-tree-fixture', str(fixture)],
+                          check=True, capture_output=True, text=True, timeout=10)
+    assert json.loads(proc.stdout) == {
+        'ok': True, 'tables': ['inbox', 'chat'], 'childReads': ['window', 'split'],
+    }
+
+
+@pytest.mark.parametrize('deep', [False, True])
+def test_table_lookup_rejects_oversized_window_tree(native_helper, tmp_path, deep):
+    tree = {'id': 'window', 'role': 'AXWindow', 'children': [
+        {'id': str(i), 'role': 'AXGroup'} for i in range(2100)
+    ]}
+    if deep:
+        tree = {'id': 'leaf', 'role': 'AXTable'}
+        for i in range(16):
+            tree = {'id': str(i), 'role': 'AXGroup', 'children': [tree]}
+    fixture = tmp_path / 'tree.json'
+    fixture.write_text(json.dumps(tree))
+    proc = subprocess.run([str(native_helper), 'table-tree-fixture', str(fixture)],
+                          check=True, capture_output=True, text=True, timeout=10)
+    result = json.loads(proc.stdout)
+    assert result['ok'] is False
+    assert result['reason'] == 'ax_scan_limit_exceeded'
+    assert result['childReadCount'] <= 2048
+
+
 def test_preview_requires_image_title_and_preview_controls(native_helper, tmp_path):
     fixture = tmp_path / 'previews.json'
     fixture.write_text(json.dumps([

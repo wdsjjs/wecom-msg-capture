@@ -11,6 +11,22 @@ AppleScript, clipboard paste, and a local SQLite queue.
 The legacy AI modes below are separate from the central-channel client. The
 current Mac edge receives central delivery commands; it does not run a local AI.
 
+## Live Send Verification
+
+Conversation lookup walks only the native window layout, stopping at tables and
+embedded web content. Navigation labels are inspected in tables of at most 20
+rows; opening a conversation inspects at most 20 conversation rows. Selected-row
+verification uses the list's selected-row attribute before reading row previews,
+and remains available when a background full-list scan has timed out. Its own
+timeout still rejects the send when identity cannot be established.
+
+The native composer lookup excludes message tables and embedded web forms. A
+nonempty or unreadable input blocks submission; the edge never clears a draft to
+make a test pass. A generated AI answer, a queued command, and a confirmed WeCom
+send are separate results. Only a visible outbound echo and its acknowledged
+command receipt demonstrate delivery. Unknown send outcomes require reconciliation,
+not another send attempt.
+
 ## Manual History Recovery
 
 The native control panel provides **补齐聊天记录** and **暂停补录**. These use the

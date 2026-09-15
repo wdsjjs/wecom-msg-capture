@@ -464,7 +464,7 @@ def _swift_ax(command: str | list[str]) -> list[dict]:
     env = _swift_ax_env()
     args = command.split(" ") if isinstance(command, str) else command
     scan_commands = {"geometry", "rows", "selected-row", "chat", "chat-all", "texts"}
-    circuit_breaker_commands = {"geometry", "rows", "selected-row", "texts"}
+    circuit_breaker_commands = {"geometry", "rows", "texts"}
     is_scan_command = bool(args and args[0] in scan_commands)
     uses_scan_circuit = bool(args and args[0] in circuit_breaker_commands)
     if uses_scan_circuit and time.monotonic() < _AX_SCAN_DISABLED_UNTIL:
@@ -899,13 +899,7 @@ def selected_conversation_row(app_name: str | None = None, *, limit: int = 30) -
     if chosen:
         if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
             activate_app(chosen)
-        # The full row scan exposes `selected` reliably on current WeCom builds,
-        # while the dedicated selected-row query can time out independently.
-        for row in _ax_conversation_rows(limit):
-            if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
-                continue
-            if row.get("selected"):
-                return row
+        # A slow background list scan must not disable the bounded send identity read.
         items = _swift_ax("selected-row")
         for item in items:
             if item.get("ok") is False:
@@ -915,6 +909,11 @@ def selected_conversation_row(app_name: str | None = None, *, limit: int = 30) -
                 if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
                     continue
                 row["selected"] = True
+                return row
+        for row in _ax_conversation_rows(limit):
+            if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
+                continue
+            if row.get("selected"):
                 return row
     for row in conversation_rows(app_name, limit=limit):
         if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:

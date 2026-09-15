@@ -211,6 +211,38 @@ func collectTables(_ element: AXUIElement, tables: inout [AXUIElement], maxDepth
     }
 }
 
+func boundedTableTree<Element>(_ root: Element, roleOf: (Element) -> String,
+                               childrenOf: (Element) throws -> [Element]) throws -> [Element] {
+    var tables: [Element] = []
+    var visited = 0
+    func walk(_ node: Element, depth: Int) throws {
+        visited += 1
+        guard visited <= 2048, depth <= 14 else { throw RecoveryError(reason: "ax_scan_limit_exceeded") }
+        let nodeRole = roleOf(node)
+        if nodeRole == "AXTable" { tables.append(node); return }
+        if nodeRole == "AXWebArea" { return }
+        for child in try childrenOf(node) { try walk(child, depth: depth + 1) }
+    }
+    try walk(root, depth: 0)
+    return tables
+}
+
+func boundedWindowTables(_ window: AXUIElement) throws -> [AXUIElement] {
+    try boundedTableTree(window, roleOf: role, childrenOf: { node in
+        do { return try recoveryElements(node, attribute: kAXChildrenAttribute as CFString, maximum: 2048) }
+        catch let error as RecoveryError where error.reason == "ax_rows_unavailable" { return [] }
+    })
+}
+
+func sidebarTables(_ window: AXUIElement) -> [AXUIElement] {
+    guard let frame = rectPayload(window), let tables = try? boundedWindowTables(window) else { return [] }
+    let right = frame["x", default: 0] + min(frame["width", default: 0] * 0.46, 760)
+    return tables.filter { table in
+        guard let rect = rectPayload(table) else { return false }
+        return rect["x", default: 0] + rect["width", default: 0] <= right
+    }
+}
+
 func appElement(bundleID: String) -> AXUIElement? {
     guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) else {
         return nil
@@ -284,19 +316,13 @@ func rowHasUnreadMarker(_ row: AXUIElement) -> Bool {
 }
 
 func looksLikeNavigationTable(_ table: AXUIElement) -> Bool {
-    let texts = collectText(table, maxDepth: 5)
-    return texts.contains("单聊") && (texts.contains("群聊") || texts.contains("@我") || texts.contains("未读"))
+    guard let rows = try? recoveryRows(table), rows.count <= 20 else { return false }
+    return !recoverySingleChatIndices(rows.map { collectText($0, maxDepth: 4) }).isEmpty
 }
 
 func navigationTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
-    var tables: [AXUIElement] = []
-    if let window = window {
-        collectTables(window, tables: &tables, maxDepth: 12)
-    }
-    if tables.isEmpty {
-        collectTables(root, tables: &tables, maxDepth: 12)
-    }
-    return tables.filter { looksLikeNavigationTable($0) }
+    guard let window = window else { return [] }
+    return sidebarTables(window).filter { looksLikeNavigationTable($0) }
 }
 
 func singleChatRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
@@ -308,16 +334,7 @@ func singleChatRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
             }
         }
     }
-    var rows: [AXUIElement] = []
-    if let window = window {
-        collectRows(window, rows: &rows, maxDepth: 14)
-    }
-    if rows.isEmpty {
-        collectRows(root, rows: &rows, maxDepth: 14)
-    }
-    return rows.first { row in
-        collectText(row, maxDepth: 4).contains("单聊")
-    }
+    return nil
 }
 
 func recoverySingleChatIndices(_ texts: [[String]]) -> [Int] {
@@ -1351,38 +1368,29 @@ func conversationTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement
 }
 
 func conversationListTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
-    var tables: [AXUIElement] = []
-    if let window = window {
-        collectTables(window, tables: &tables, maxDepth: 12)
-    }
-    if tables.isEmpty {
-        collectTables(root, tables: &tables, maxDepth: 12)
-    }
-    let navRects = navigationTables(root: root, window: window).compactMap { rectPayload($0) }
+    guard let window = window else { return [] }
+    let tables = sidebarTables(window)
+    let navigation = tables.filter { looksLikeNavigationTable($0) }
+    let navRects = navigation.compactMap { rectPayload($0) }
     let navRight = navRects.map { $0["x", default: 0] + $0["width", default: 0] }.max() ?? 0
-    let windowRect = window.flatMap { rectPayload($0) }
+    let windowRect = rectPayload(window)
     let maxConversationRight = windowRect.map { rect in
         rect["x", default: 0] + min(rect["width", default: 0] * 0.46, 760)
     } ?? 0
     return tables.filter { table in
-        if looksLikeNavigationTable(table) {
+        if navigation.contains(where: { CFEqual($0, table) }) {
             return false
         }
         guard let rect = rectPayload(table) else {
             return false
         }
-        let tableTexts = collectText(table, maxDepth: 4)
-        if tableTexts.contains("单聊") || tableTexts.contains("群聊") || tableTexts.contains("内部聊天") {
-            return false
-        }
-        let rowCount = children(table).filter { role($0) == "AXRow" }.count
         let x = rect["x", default: 0]
         let width = rect["width", default: 0]
-        return rowCount > 0
-            && width >= 220
+        return width >= 220
             && width <= 680
             && (navRight <= 0 || x >= navRight - 8)
             && (maxConversationRight <= 0 || x + width <= maxConversationRight)
+            && !((try? recoveryRows(table)) ?? []).isEmpty
     }.sorted { lhs, rhs in
         let lr = rectPayload(lhs) ?? [:]
         let rr = rectPayload(rhs) ?? [:]
@@ -1461,27 +1469,13 @@ func selectedConversationRow(root: AXUIElement, window: AXUIElement?) -> AXUIEle
         }
         return first == "单聊" || first == "群聊" || first == "@我" || first == "未读" || first == "内部聊天"
     }
-    for table in conversationListTables(root: root, window: window) {
-        for row in children(table) where role(row) == "AXRow" {
-            if isNavigationRow(row) {
-                continue
-            }
-            let payload = rowPayload(row, index: 1)
-            if payload["selected"] as? Bool ?? false {
-                return row
-            }
-        }
-    }
-    for row in conversationRows(root: root, window: window) {
-        if isNavigationRow(row) {
-            continue
-        }
-        let payload = rowPayload(row, index: 1)
-        if payload["selected"] as? Bool ?? false {
-            return row
-        }
-    }
-    return nil
+    let tables = conversationListTables(root: root, window: window)
+    guard tables.count == 1, let table = tables.first else { return nil }
+    // Selected-row lookup must not expand every conversation's preview or chat content.
+    let selected = (try? recoveryElements(table, attribute: kAXSelectedRowsAttribute as CFString, maximum: 2))
+        ?? ((try? recoveryRows(table)) ?? []).filter { recoveryNumber($0, kAXSelectedAttribute as CFString) == 1 }
+    guard selected.count == 1, let row = selected.first, !isNavigationRow(row) else { return nil }
+    return row
 }
 
 func allRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
@@ -1665,6 +1659,8 @@ func settableTextInputs(_ element: AXUIElement, inputs: inout [AXUIElement], max
         return
     }
     let elementRole = role(element)
+    // Message bodies and embedded web forms cannot be the native chat composer.
+    if elementRole == "AXTable" || elementRole == "AXWebArea" { return }
     if elementRole == "AXTextArea" || elementRole == "AXTextField" {
         var settable = DarwinBoolean(false)
         let result = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
@@ -1833,8 +1829,11 @@ func collectWebAreas(_ element: AXUIElement, out: inout [AXUIElement], maxDepth:
     if depth > maxDepth {
         return
     }
-    if role(element) == "AXWebArea" {
+    let elementRole = role(element)
+    if elementRole == "AXTable" { return }
+    if elementRole == "AXWebArea" {
         out.append(element)
+        return
     }
     for child in children(element) {
         collectWebAreas(child, out: &out, maxDepth: maxDepth, depth: depth + 1)
@@ -2228,22 +2227,7 @@ func recoveryScrollbar(_ area: AXUIElement) -> AXUIElement? {
 
 func recoverySnapshot(root: AXUIElement, kind: String) throws -> RecoverySnapshot {
     guard let window = mainWindow(root), let frame = rectPayload(window) else { throw RecoveryError(reason: "window_unavailable") }
-    var tables: [AXUIElement] = []
-    var visited = 0
-    func walk(_ node: AXUIElement, depth: Int) throws {
-        visited += 1
-        guard visited <= 2048, depth <= 14 else { throw RecoveryError(reason: "ax_scan_limit_exceeded") }
-        let nodeRole = role(node)
-        if nodeRole == "AXTable" { tables.append(node); return }
-        if nodeRole == "AXWebArea" { return }
-        let descendants: [AXUIElement]
-        do { descendants = try recoveryElements(node, attribute: kAXChildrenAttribute as CFString, maximum: 2048) }
-        catch let error as RecoveryError where error.reason == "ax_rows_unavailable" { return }
-        for child in descendants {
-            try walk(child, depth: depth + 1)
-        }
-    }
-    try walk(window, depth: 0)
+    let tables = try boundedWindowTables(window)
     let listRight = frame["x", default: 0] + min(frame["width", default: 0] * 0.46, 760)
     if kind == "inbox" {
         var singleRows: [AXUIElement] = []
@@ -2435,6 +2419,21 @@ func intArg(_ index: Int, defaultValue: Int) -> Int {
 
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : "rows"
+if command == "table-tree-fixture", args.count == 3 {
+    struct Node: Decodable { let id: String; let role: String; let children: [Node]? }
+    var reads: [String] = []
+    do {
+        let root = try JSONDecoder().decode(Node.self, from: Data(contentsOf: URL(fileURLWithPath: args[2])))
+        let tables = try boundedTableTree(root, roleOf: { $0.role }, childrenOf: { node in
+            reads.append(node.id)
+            return node.children ?? []
+        })
+        jsonLine(["ok": true, "tables": tables.map { $0.id }, "childReads": reads])
+    } catch let error as RecoveryError {
+        jsonLine(["ok": false, "reason": error.reason, "childReadCount": reads.count])
+    } catch { fputs("Invalid table tree fixture\n", stderr); exit(2) }
+    exit(0)
+}
 if command == "preview-evidence-fixture", args.count == 3 {
     do {
         guard let cases = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[2]))) as? [[String: Any]] else { exit(2) }
@@ -2841,7 +2840,7 @@ if command == "recovery-chat-page" || command == "recovery-inbox-page" || comman
         "screen": screenPayload()
     ])
 } else if command == "open" {
-    let rows = conversationRows(root: root, window: window)
+    let rows = recentConversationRows(root: root, window: window, limit: 20)
     let target = args.dropFirst(2).joined(separator: " ")
     if target.isEmpty {
         fputs("missing target\n", stderr)
