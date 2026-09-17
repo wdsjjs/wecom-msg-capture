@@ -29,6 +29,12 @@ not another send attempt.
 
 ## Manual History Recovery
 
+The **补录明细** button opens a reusable, read-only window on the active desktop.
+It shows recovery counts, recent conversations, message summaries and upload
+errors, not a full image viewer. Closing and reopening it refreshes the same
+window without starting collection. The root Chinese launchers are the supported
+desktop shortcuts; redundant English start/stop/log aliases have been removed.
+
 The native control panel provides **补齐聊天记录** and **暂停补录**. These use the
 same supervisor and edge process as normal collection:
 

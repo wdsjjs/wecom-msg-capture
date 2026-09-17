@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_FILE="$ROOT_DIR/wecom-gui/.codex-run/wecom-agent.log"
+LOG_FILE="$ROOT_DIR/wecom-gui/.codex-run/wecom-edge-channel.log"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"

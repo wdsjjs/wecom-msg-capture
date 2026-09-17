@@ -47,32 +47,31 @@ Install or repair a Mac with:
 ./install.command
 ```
 
-Then start the customer-service agent and its WeCom edge channel:
+Open the unified control panel, then start reception using its button:
 
 ```bash
-./start-agent.command
+./启动客服.command
 ```
 
 Stop it:
 
 ```bash
-./stop-agent.command
+./停止客服.command
 ```
 
 Watch logs:
 
 ```bash
-./logs.command
+./查看日志.command
 ```
 
 The shell equivalents are:
 
 ```bash
 cd wecom-gui
-./scripts/wecom-agent start
-./scripts/wecom-agent review-start
-./scripts/wecom-agent stop
-./scripts/wecom-agent logs
+./scripts/wecom-control start
+./scripts/wecom-control stop
+./scripts/wecom-supervisor status
 ```
 
 ## Review Mode

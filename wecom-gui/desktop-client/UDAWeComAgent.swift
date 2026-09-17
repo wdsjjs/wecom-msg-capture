@@ -425,7 +425,7 @@ private final class FloatingDashboardView: NSView {
             : hasGap ? (gap == "0" ? "有历史记录待对齐" : "\(gap) 处历史记录待对齐") : ""
         text(notice, 24, top - 303, 250, size: 12, color: .systemOrange)
         if !notice.isEmpty {
-            button("details", "查看详情", "info.circle", NSRect(x: 280, y: top - 302, width: 116, height: 28))
+            button("noticeDetails", "查看详情", "info.circle", NSRect(x: 280, y: top - 302, width: 116, height: 28))
         }
         divider(top - 320)
         text("聊天记录补录", 24, top - 357, 180, size: 14, weight: .semibold)
@@ -466,7 +466,7 @@ private final class FloatingDashboardView: NSView {
     }
     @objc private func activate(_ sender: NSButton) {
         switch sender.identifier?.rawValue {
-        case "details": onDetails?()
+        case "details", "noticeDetails": onDetails?()
         case "logs": onLogs?()
         case "workbench": onWorkbench?()
         case "expand":
@@ -886,18 +886,34 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showDetails() {
-        if let detailWindow, detailWindow.isVisible {
-            detailTextView?.string = detailsText
-            detailWindow.makeKeyAndOrderFront(nil)
-            return
+        if detailWindow == nil {
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
+            text.isEditable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            detailTextView = text
+            let scroll = NSScrollView(frame: text.bounds)
+            scroll.documentView = text
+            scroll.hasVerticalScroller = true
+            scroll.autoresizingMask = [.width, .height]
+            let window = NSWindow(contentRect: text.bounds, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.title = "企微客服助手 - 补录明细与运行记录"
+            window.contentView = scroll
+            window.isReleasedWhenClosed = false
+            window.level = .floating
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.minSize = NSSize(width: 480, height: 320)
+            detailWindow = window
         }
-        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 760, height: 520)); text.isEditable = false
-        detailTextView = text
-        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        text.string = detailsText
-        let scroll = NSScrollView(frame: text.bounds); scroll.documentView = text; scroll.hasVerticalScroller = true; scroll.autoresizingMask = [.width, .height]
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = "企微客服助手 - 补录明细与运行记录"; window.contentView = scroll; detailWindow = window; window.makeKeyAndOrderFront(nil)
+        detailTextView?.string = detailsText
+#if !DESKTOP_RENDER_TEST
+        guard let window = detailWindow else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+#endif
     }
 }
 
@@ -1018,6 +1034,13 @@ private extension AgentApp {
         precondition(commands == ["runtime-status"], "Opening the app started a service")
         precondition(agent.floatingPanel?.isVisible == false && agent.timer == nil, "Test opened live UI or polling")
         let view = agent.dashboard!
+        agent.showDetails()
+        let details = agent.detailWindow!
+        precondition(!details.isReleasedWhenClosed && details.level == .floating)
+        details.close()
+        agent.showDetails()
+        precondition(agent.detailWindow === details && agent.detailTextView?.string == agent.detailsText)
+        precondition(commands == ["runtime-status"], "Opening details started a service")
         precondition(agent.commandItems["pause-recovery"]?.isEnabled == false)
 
         // Leave the launch read pending to exercise a stale response crossing a command.
@@ -1212,6 +1235,14 @@ private func runDesktopRenderTest() {
     view.onStartEdge = { starts += 1 }
     view.clickControl("edge")
     precondition(starts == 1, "Start control did not dispatch its callback")
+    let detailsView = FloatingDashboardView(frame: NSRect(origin: .zero, size: FloatingDashboardView.panelSize))
+    detailsView.controlNotice = "有历史记录待对齐"
+    detailsView.clickControl("expand")
+    var detailClicks = 0
+    detailsView.onDetails = { detailClicks += 1 }
+    detailsView.clickControl("noticeDetails")
+    detailsView.clickControl("details")
+    precondition(detailClicks == 2, "Both detail buttons must remain independently clickable")
     print("{\"frames\":\(iterations),\"max_text_controls\":\(maxLabels),\"nonblank\":true,\"control_click\":true,\"breathing\":true,\"recovery_modes\":84,\"command_routing\":true,\"duplicate_guard\":true,\"stale_status\":true,\"no_autostart\":true,\"privacy\":true,\"nonoverlap\":true,\"release_barrier\":true,\"partial_counts\":true,\"controlled_errors\":true}")
 }
 runDesktopRenderTest()
