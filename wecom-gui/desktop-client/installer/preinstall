@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+# Refuse replacement while either the panel or its detached worker is running.
+# The installer must never kill a command that may already be sending.
+if /usr/bin/pgrep -x WeComCapture >/dev/null 2>&1 ||
+   /usr/bin/pgrep -f 'cli_anything[.]wecom_gui edge-channel run' >/dev/null 2>&1; then
+    printf '%s\n' '请先在企微消息助手中暂停接收并退出应用，再重新安装。' >&2
+    exit 1
+fi
+exit 0

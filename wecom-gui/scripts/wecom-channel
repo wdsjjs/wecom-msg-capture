@@ -1,0 +1,29 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Compatibility wrapper. The supervisor is the sole owner of worker sessions.
+SCRIPT_DIR="${0:A:h}"
+SUPERVISOR="$SCRIPT_DIR/wecom-supervisor"
+ACTION="${1:-status}"
+
+case "$ACTION" in
+  preflight)
+    command -v screen >/dev/null 2>&1 || { print -u2 "ERROR: screen is required"; exit 1; }
+    "$SUPERVISOR" status
+    ;;
+  start|stop|restart)
+    "$SUPERVISOR" "$ACTION" edge
+    ;;
+  status)
+    "$SUPERVISOR" status
+    ;;
+  logs)
+    LOG_FILE="${WECOM_EDGE_CHANNEL_LOG:-${SCRIPT_DIR:h}/.codex-run/wecom-capture-edge.log}"
+    touch "$LOG_FILE"
+    exec tail -n 200 -f "$LOG_FILE"
+    ;;
+  *)
+    print -u2 "Usage: $0 {preflight|start|stop|restart|status|logs}"
+    exit 2
+    ;;
+esac
