@@ -41,11 +41,9 @@ In `auto` mode, `ready` is consumed directly. In `review` mode, `ready` means
 
 ## Quick Start
 
-Install or repair a Mac with:
-
-```bash
-./install.command
-```
+For the current central-channel client, follow [SETUP_MAC.md](SETUP_MAC.md).
+The legacy `install.command` and `一键安装.command` still target the old local-AI
+stack and are not supported installation paths for the edge client.
 
 Open the unified control panel, then start reception using its button:
 
@@ -231,7 +229,7 @@ deploy/mac.shared.env              Shared LAN service config generated during in
 ## Documentation Map
 
 - `README.md`: project overview and operating model.
-- `SETUP_MAC.md`: Mac installation, host service restore, and permissions.
+- `SETUP_MAC.md`: current Mac edge installation, device configuration, and permissions.
 - `wecom-gui/cli_anything/wecom_gui/README.md`: GUI agent commands, review
   page, queue states, testing.
 - `wecom-gui/WECOM_GUI.md`: GUI automation SOP and safety checklist.

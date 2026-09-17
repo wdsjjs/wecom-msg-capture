@@ -1,149 +1,63 @@
-# macOS Setup
+# Mac 边缘通道安装
 
-Recommended project location:
+当前正式链路是：企业微信桌面采集 -> 中台处理 -> 边缘执行发送。
+统一控制面板负责启动、暂停、补录和查看状态；本机不需要配置 Pi 模型或 PostgreSQL。
 
-```bash
-~/Desktop/uda-codex-wecome
-```
+## 环境准备
 
-If the project is placed elsewhere, `scripts/install-config.sh` still rewrites
-local paths to the actual project root.
+- macOS，已安装并登录企业微信。
+- Python 3.10 或更新版本。
+- Xcode Command Line Tools（`xcode-select --install`），用于编译 Swift。
+- `screen` 命令，用于管理边缘进程。
+- 管理员为本机分配的中台地址、设备 ID 和设备 Token。
 
-Install on a new Mac:
+旧 `一键安装.command` / `install.command` 仍是遗留本地 AI 安装流程，
+不适用于当前边缘通道。请使用以下手动步骤。
 
-Double-click:
+## 安装与配置
 
-```text
-install.command
-```
-
-The installer requires Python 3.10 or newer and Pi coding-agent. If the Mac
-only has Python 3.9, `install.command` checks Xcode Command Line Tools first,
-installs Homebrew when missing, installs Python 3.12 and Node.js through
-Homebrew, installs `@earendil-works/pi-coding-agent`, then creates a
-project-local `.venv`. The Command Line Tools install may open a macOS popup,
-and the Homebrew install may ask for the Mac login password. Homebrew and pip
-use the Tsinghua Tuna mirrors by default; set `HOMEBREW_MIRROR=official` or
-`PYPI_MIRROR=official` before running the script to use official sources.
-
-`install.command` also writes Pi provider files under:
-
-```text
-~/.codex-csbot-wecom/pi-home/settings.json
-~/.codex-csbot-wecom/pi-home/models.json
-~/.codex-csbot-wecom/pi-home/auth.json
-```
-
-These files register `uda-openai` and `deepseek-v4-flash`. This is required;
-`WECOM_GUI_PI_PROVIDER=uda-openai` alone is not enough.
-
-PostgreSQL and MEM0 are expected to run on the main LAN machine, not on every
-Mac. On the host Mac, initialize PostgreSQL and LAN access:
+在仓库根目录执行：
 
 ```bash
-cd ~/Desktop/uda-codex-wecome
-CSBOT_PG_PASSWORD='change-this-password' ./scripts/setup-pg-host.sh
+python3 -m venv .venv
+.venv/bin/python -m pip install ./wecom-gui
 ```
 
-The script creates database `csbot_wecom`, role `csbot_app`, appends a managed
-LAN rule to PostgreSQL config, restarts PostgreSQL, and writes `CSBOT_PG_DSN`
-to `deploy/mac.shared.env`.
-
-Put the shared PG, Feishu, Weiban, and MEM0 settings in `deploy/mac.shared.env`
-before delivery:
-
-```env
-CSBOT_PG_DSN='postgresql://csbot_app:<password>@192.168.110.53:5432/csbot_wecom'
-FEISHU_APP_ID='replace-with-feishu-app-id'
-FEISHU_APP_SECRET='replace-with-feishu-app-secret'
-FEISHU_APP_TOKEN='HyP6bKXVvaK9nXsOMO3cwZTenzb'
-WEIBAN_BASE_URL='https://open.weibanzhushou.com'
-WEIBAN_CORP_ID='replace-with-weiban-corp-id'
-WEIBAN_SECRET='replace-with-weiban-secret'
-CSBOT_MEM0_URL='http://192.168.110.53:8888'
-CSBOT_MEM0_API_KEY='replace-with-your-mem0-api-key'
-CSBOT_MEM0_GLOBAL_USER_ID='global-kb'
-```
-
-`scripts/install-config.sh` writes these values into both `wecom-gui/.env.local`
-and `codex-csbot-wecom/.env`. The install summary prints the MEM0 URL and masks
-the API key, webhook, passwords, and secrets.
-
-or:
+在 `wecom-gui/.env.local` 中配置以下字段；路径替换成本机绝对路径。
+如果文件已经存在，仅修改所需字段，保留其他配置。
 
 ```bash
-cd ~/Desktop/uda-codex-wecome
-./scripts/install-deps.sh
-./scripts/install-config.sh
-./scripts/install-csbot-sync-launchd.sh
-cd wecom-gui
-./scripts/wecom-agent start
+WECOM_GUI_PYTHON='/absolute/path/to/repository/.venv/bin/python'
+WECOM_CHANNEL_BASE_URL='https://your-central-service.example.com'
+WECOM_CHANNEL_DEVICE_ID='assigned-device-id'
+WECOM_CHANNEL_DEVICE_TOKEN='assigned-device-token'
 ```
 
-Useful commands:
+设备凭据单独分配，不复制其他机器的 Token，不提交 `.env.local`。
+
+## 打开控制面板
+
+双击 `启动客服.command`，或在仓库根目录执行：
 
 ```bash
-./start-agent.command
-./stop-agent.command
-./logs.command
-./修复PiProvider.command
+./启动客服.command
 ```
 
-`start-agent.command` (or `启动客服.command`) only opens the native control
-panel. It does not start Enterprise WeChat or resume message processing.
-Start those services from the panel buttons, or explicitly run:
+它会构建并安装 `~/Applications/UDA WeCom Agent.app`，然后打开面板。
+打开面板不自动启动收发；替换旧版应用时会停止边缘进程。
 
-```bash
-./wecom-gui/scripts/wecom-control start-all
-```
+在系统设置的“隐私与安全性”中，为该应用授予“辅助功能”和“屏幕录制”权限。
+更新后若权限失效，移除旧条目再添加新应用，并重新打开客户端。
 
-All lifecycle actions still use the same supervisor, and running the control
-panel repeatedly is idempotent. `stop-agent.command` stops the controlled edge
-channel, Enterprise WeChat, and the panel.
+## 日常操作
 
-The panel checks its own Accessibility and Screen Recording permissions before
-starting the edge channel. Grant them to `UDA WeCom Agent`, not only to Terminal
-or Codex. If an updated local build stops reading while the checkbox is still
-enabled, remove the old Accessibility entry and add
-`~/Applications/UDA WeCom Agent.app` again. Reopen the panel after granting
-Screen Recording; services still require an explicit start.
+- 面板点击“启动接收”，确认中台连接后使用测试会话验证收发。
+- AI 回复由中台接待配置控制；连接成功不代表 AI 已开启或消息已送达。
+- “补录”是显式操作，历史消息不触发新 AI 回复。
+- “补录明细”显示会话进度、消息摘要、上传状态和缺口，不是完整图片查看器。
+- `查看日志.command` 查看当前边缘通道日志。
+- `停止客服.command` 停止边缘通道、退出企业微信和控制面板。
 
-The desktop installer skips unchanged builds and stops the controlled edge
-before replacing the app. For deployed Macs, set `WECOM_DESKTOP_SIGN_IDENTITY`
-to an installed signing certificate. Without a certificate, builds use ad-hoc
-signing and macOS may require renewed permission after a code change.
+只想暂停采集时，使用面板的“暂停接收”。恢复补录后的正常收发使用“恢复接收”。
 
-If an already-installed Mac reports that `uda-openai` is missing or that
-`models.json` is empty, double-click `修复PiProvider.command`. It rewrites the
-Pi provider JSON and verifies:
-
-```bash
-PI_CODING_AGENT_DIR="$HOME/.codex-csbot-wecom/pi-home" pi --offline --list-models deepseek
-```
-
-Terminal equivalents:
-
-```bash
-./scripts/wecom-agent stop
-tail -f .codex-run/wecom-agent.log
-```
-
-Knowledge sync commands:
-
-```bash
-cd ~/Desktop/uda-codex-wecome/codex-csbot-wecom
-../.venv/bin/python -m csbot feishu sync --dry-run
-../.venv/bin/python -m csbot weiban sync --dry-run
-../.venv/bin/python -m csbot sync all --progress
-../.venv/bin/python -m csbot retrieve --customer-id test --query "鱼油起拍数量"
-```
-
-`AI 知识库.xlsx` remains only a manual fallback. The default knowledge source is
-Feishu Bitable plus Weiban FAQ synced into PostgreSQL and then imported into
-MEM0. The WeCom GUI local queue SQLite remains local to each Mac.
-
-Required macOS permissions:
-
-- Accessibility for the terminal app used to run the agent.
-- Screen Recording if macOS prompts for it.
-- Enterprise WeChat must be logged in and visible.
+当前恢复协议与运行边界见 [WECOM_GUI.md](wecom-gui/WECOM_GUI.md)。
