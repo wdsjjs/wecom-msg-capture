@@ -1,0 +1,53 @@
+name: 演示工作台发布
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demo/**'
+      - '.github/workflows/demo-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install ./wecom-gui pytest
+      - run: python -m pytest wecom-gui/cli_anything/wecom_gui/tests/test_public_distribution.py -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - run: npm ci
+        working-directory: demo
+      - run: npm test
+        working-directory: demo
+      - run: npm run build
+        working-directory: demo
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/dist
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

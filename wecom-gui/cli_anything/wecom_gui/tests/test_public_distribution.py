@@ -79,6 +79,8 @@ def test_public_sources_have_no_runtime_artifacts_or_unreviewed_url_hosts():
         "example.invalid",
         "channel.example.com",
         "localhost",
+        "127.0.0.1",
+        "wdsjjs.github.io",
     }
     for name in filter(None, names):
         path = ROOT / name
@@ -93,7 +95,22 @@ def test_public_sources_have_no_runtime_artifacts_or_unreviewed_url_hosts():
             ".pem",
             ".key",
         }, name
+        if path.suffix == ".png":
+            assert name in {"demo/public/device-sample.png", "docs/demo-preview.png"}, name
+            data = path.read_bytes()
+            assert data.startswith(b"\x89PNG\r\n\x1a\n"), name
+            offset = 8
+            while offset < len(data):
+                length = int.from_bytes(data[offset:offset + 4], "big")
+                kind = data[offset + 4:offset + 8]
+                assert kind in {b"IHDR", b"IDAT", b"IEND", b"sRGB", b"gAMA", b"pHYs", b"cHRM"}, (name, kind)
+                offset += length + 12
+            assert offset == len(data), name
+            continue
         content = path.read_text(encoding="utf-8")
+        hosts = reviewed_hosts
+        if name == "demo/package-lock.json":
+            hosts = hosts | {"registry.npmjs.org", "github.com", "opencollective.com", "tidelift.com"}
         for url in re.findall(r"https?://[^\s\x22\x27<>`]+", content):
             host = urlsplit(url).hostname
-            assert host is None or host in reviewed_hosts, (name, host)
+            assert host is None or host in hosts, (name, host)
